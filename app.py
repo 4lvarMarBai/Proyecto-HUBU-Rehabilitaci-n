@@ -1,13 +1,13 @@
 # app.py
 # Ejecuta con: python -m streamlit run app.py
 
-import sqlite3
+import os
 from datetime import datetime, UTC, date, time
+
+import psycopg
 import streamlit as st
 
 # -------------------- Config --------------------
-DB_PATH = "rehab_app_ui_v2.db"  # nombre nuevo para evitar conflictos con BDs antiguas
-
 SPECIALTIES = ["Electroterapia", "Terapia ocupacional", "Logopedia", "Cinesiterapia"]
 CINESITERAPIA_SUBSPECIALTIES = [
     "Linfedema",
@@ -28,74 +28,84 @@ DAYS_6_MONTHS = 183
 
 
 # -------------------- DB helpers --------------------
+def get_database_url() -> str:
+    db_url = st.secrets.get("DATABASE_URL", None)
+    if not db_url:
+        db_url = os.getenv("DATABASE_URL")
+
+    if not db_url:
+        raise RuntimeError(
+            "No se ha encontrado DATABASE_URL. "
+            "Configúrala en .streamlit/secrets.toml o como variable de entorno."
+        )
+    return db_url
+
+
+@st.cache_resource
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON;")
+    conn = psycopg.connect(get_database_url(), autocommit=True)
     return conn
 
 
 def init_db(conn):
-    cur = conn.cursor()
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS waitlist (
+            id BIGSERIAL PRIMARY KEY,
+            patient_id TEXT NOT NULL,
+            priority_level TEXT NOT NULL CHECK(priority_level IN ('urgente','preferente','ordinario')),
+            specialty TEXT NOT NULL CHECK(specialty IN ('Electroterapia','Terapia ocupacional','Logopedia','Cinesiterapia')),
+            subspecialty TEXT,
+            request_date TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            status TEXT NOT NULL DEFAULT 'WAITING' CHECK(status IN ('WAITING','ASSIGNED','CANCELLED')),
+            eligible BOOLEAN NOT NULL DEFAULT TRUE
+        );
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS waitlist (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        patient_id TEXT NOT NULL,
-        priority_level TEXT NOT NULL CHECK(priority_level IN ('urgente','preferente','ordinario')),
-        specialty TEXT NOT NULL CHECK(specialty IN ('Electroterapia','Terapia ocupacional','Logopedia','Cinesiterapia')),
-        subspecialty TEXT, -- NUEVO: solo para Cinesiterapia
-        request_date TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'WAITING' CHECK(status IN ('WAITING','ASSIGNED','CANCELLED')),
-        eligible INTEGER NOT NULL DEFAULT 1 CHECK(eligible IN (0,1))
-    );
-    """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS rehab_active (
+            id BIGSERIAL PRIMARY KEY,
+            patient_id TEXT NOT NULL,
+            specialty TEXT NOT NULL,
+            subspecialty TEXT,
+            start_date TIMESTAMPTZ NOT NULL,
+            source_waitlist_id BIGINT NOT NULL,
+            assigned_by TEXT NOT NULL,
+            assigned_at TIMESTAMPTZ NOT NULL,
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS rehab_active (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        patient_id TEXT NOT NULL,
-        specialty TEXT NOT NULL,
-        subspecialty TEXT, -- NUEVO
-        start_date TEXT NOT NULL,
-        source_waitlist_id INTEGER NOT NULL,
-        assigned_by TEXT NOT NULL,
-        assigned_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','DISCHARGED')),
+            discharge_reason TEXT,
+            discharged_at TIMESTAMPTZ,
 
-        status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','DISCHARGED')),
-        discharge_reason TEXT,
-        discharged_at TEXT,
+            FOREIGN KEY(source_waitlist_id) REFERENCES waitlist(id)
+        );
+        """)
 
-        FOREIGN KEY(source_waitlist_id) REFERENCES waitlist(id)
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS assignment_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        event TEXT NOT NULL, -- AUTO_ASSIGNMENT, DISCHARGE, MANUAL_ADD, CANCEL
-        waitlist_id INTEGER,
-        rehab_active_id INTEGER,
-        patient_id TEXT NOT NULL,
-        specialty TEXT,
-        subspecialty TEXT, -- NUEVO
-        chosen_priority_level TEXT,
-        wait_days INTEGER,
-        rule_applied TEXT,
-        reason TEXT,
-        actor TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    );
-    """)
-
-    conn.commit()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS assignment_log (
+            id BIGSERIAL PRIMARY KEY,
+            event TEXT NOT NULL,
+            waitlist_id BIGINT,
+            rehab_active_id BIGINT,
+            patient_id TEXT NOT NULL,
+            specialty TEXT,
+            subspecialty TEXT,
+            chosen_priority_level TEXT,
+            wait_days INTEGER,
+            rule_applied TEXT,
+            reason TEXT,
+            actor TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL
+        );
+        """)
 
 
 def fetch_all(conn, query, params=()):
-    cur = conn.cursor()
-    cur.execute(query, params)
-    cols = [c[0] for c in cur.description]
-    rows = cur.fetchall()
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        cols = [desc.name for desc in cur.description]
+        rows = cur.fetchall()
     return cols, rows
 
 
@@ -123,9 +133,9 @@ def _selection_sql(where_extra: str = "") -> str:
                 specialty,
                 subspecialty,
                 request_date,
-                CAST((julianday(?) - julianday(request_date)) AS INTEGER) AS wait_days
+                FLOOR(EXTRACT(EPOCH FROM (%s::timestamptz - request_date)) / 86400)::INTEGER AS wait_days
             FROM waitlist
-            WHERE status='WAITING' AND eligible=1
+            WHERE status='WAITING' AND eligible=TRUE
             {extra}
         )
         SELECT
@@ -170,12 +180,11 @@ def _build_filters(specialty_filter: str, subspecialty_filter: str):
     params = []
 
     if specialty_filter != "Todas":
-        where_parts.append("specialty = ?")
+        where_parts.append("specialty = %s")
         params.append(specialty_filter)
 
-        # Solo tiene sentido subespecialidad si es Cinesiterapia
         if specialty_filter == "Cinesiterapia" and subspecialty_filter != "Todas":
-            where_parts.append("subspecialty = ?")
+            where_parts.append("subspecialty = %s")
             params.append(subspecialty_filter)
 
     where_extra = " AND ".join(where_parts)
@@ -183,14 +192,15 @@ def _build_filters(specialty_filter: str, subspecialty_filter: str):
 
 
 def preview_next_patient(conn, specialty_filter: str, subspecialty_filter: str):
-    cur = conn.cursor()
     base_now = now_iso()
 
     where_extra, extra_params = _build_filters(specialty_filter, subspecialty_filter)
     sql = _selection_sql(where_extra=where_extra)
 
-    cur.execute(sql, tuple([base_now] + extra_params))
-    row = cur.fetchone()
+    with conn.cursor() as cur:
+        cur.execute(sql, tuple([base_now] + extra_params))
+        row = cur.fetchone()
+
     if not row:
         return None
 
@@ -201,7 +211,7 @@ def preview_next_patient(conn, specialty_filter: str, subspecialty_filter: str):
         "priority_level": priority_level,
         "specialty": specialty,
         "subspecialty": subspecialty,
-        "request_date": request_date,
+        "request_date": request_date.isoformat() if hasattr(request_date, "isoformat") else str(request_date),
         "wait_days": int(wait_days),
         "rule_applied": rule_applied,
     }
@@ -219,136 +229,143 @@ def add_waiting_patient(
 ):
     created_at = now_iso()
 
-    # Forzamos subspecialty a None si no es Cinesiterapia
     if specialty != "Cinesiterapia":
         subspecialty = None
 
-    conn.execute(
-        """
-        INSERT INTO waitlist (patient_id, priority_level, specialty, subspecialty, request_date, created_at, status, eligible)
-        VALUES (?,?,?,?,?,?,?,?)
-        """,
-        (patient_id, priority_level, specialty, subspecialty, request_date_iso, created_at, "WAITING", 1 if eligible else 0),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO waitlist (
+                patient_id, priority_level, specialty, subspecialty,
+                request_date, created_at, status, eligible
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                patient_id,
+                priority_level,
+                specialty,
+                subspecialty,
+                request_date_iso,
+                created_at,
+                "WAITING",
+                eligible,
+            ),
+        )
 
-    conn.execute(
-        """
-        INSERT INTO assignment_log
-            (event, waitlist_id, rehab_active_id, patient_id, specialty, subspecialty, chosen_priority_level, wait_days, rule_applied, reason, actor, created_at)
-        VALUES
-            ('MANUAL_ADD', NULL, NULL, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
-        """,
-        (patient_id, specialty, subspecialty, priority_level, actor, created_at),
-    )
-
-    conn.commit()
+        cur.execute(
+            """
+            INSERT INTO assignment_log
+                (event, waitlist_id, rehab_active_id, patient_id, specialty, subspecialty,
+                 chosen_priority_level, wait_days, rule_applied, reason, actor, created_at)
+            VALUES
+                ('MANUAL_ADD', NULL, NULL, %s, %s, %s, %s, NULL, NULL, NULL, %s, %s)
+            """,
+            (patient_id, specialty, subspecialty, priority_level, actor, created_at),
+        )
 
 
 def assign_next_patient(conn, assigned_by="SYSTEM", specialty_filter="Todas", subspecialty_filter="Todas"):
     now = now_iso()
-    cur = conn.cursor()
 
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        where_extra, extra_params = _build_filters(specialty_filter, subspecialty_filter)
-        sql = _selection_sql(where_extra=where_extra)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            where_extra, extra_params = _build_filters(specialty_filter, subspecialty_filter)
+            sql = _selection_sql(where_extra=where_extra)
 
-        cur.execute(sql, tuple([now] + extra_params))
-        row = cur.fetchone()
-        if not row:
-            conn.execute("COMMIT")
-            return None
+            cur.execute(sql, tuple([now] + extra_params))
+            row = cur.fetchone()
+            if not row:
+                return None
 
-        waitlist_id, patient_id, priority_level, specialty, subspecialty, request_date, wait_days, rule_applied = row
+            waitlist_id, patient_id, priority_level, specialty, subspecialty, request_date, wait_days, rule_applied = row
 
-        cur.execute("""
-            INSERT INTO rehab_active
-                (patient_id, specialty, subspecialty, start_date, source_waitlist_id, assigned_by, assigned_at, status)
-            VALUES
-                (?,?,?,?,?,? ,?,'ACTIVE')
-        """, (patient_id, specialty, subspecialty, now, waitlist_id, assigned_by, now))
-        rehab_active_id = cur.lastrowid
+            cur.execute("""
+                INSERT INTO rehab_active
+                    (patient_id, specialty, subspecialty, start_date, source_waitlist_id, assigned_by, assigned_at, status)
+                VALUES
+                    (%s,%s,%s,%s,%s,%s,%s,'ACTIVE')
+                RETURNING id
+            """, (patient_id, specialty, subspecialty, now, waitlist_id, assigned_by, now))
+            rehab_active_id = cur.fetchone()[0]
 
-        cur.execute("""
-            UPDATE waitlist
-            SET status='ASSIGNED'
-            WHERE id=? AND status='WAITING'
-        """, (waitlist_id,))
+            cur.execute("""
+                UPDATE waitlist
+                SET status='ASSIGNED'
+                WHERE id=%s AND status='WAITING'
+            """, (waitlist_id,))
 
-        cur.execute("""
-            INSERT INTO assignment_log
-                (event, waitlist_id, rehab_active_id, patient_id, specialty, subspecialty, chosen_priority_level, wait_days, rule_applied, reason, actor, created_at)
-            VALUES
-                ('AUTO_ASSIGNMENT', ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-        """, (waitlist_id, rehab_active_id, patient_id, specialty, subspecialty, priority_level, int(wait_days), rule_applied, assigned_by, now))
+            cur.execute("""
+                INSERT INTO assignment_log
+                    (event, waitlist_id, rehab_active_id, patient_id, specialty, subspecialty,
+                     chosen_priority_level, wait_days, rule_applied, reason, actor, created_at)
+                VALUES
+                    ('AUTO_ASSIGNMENT', %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s)
+            """, (
+                waitlist_id, rehab_active_id, patient_id, specialty, subspecialty,
+                priority_level, int(wait_days), rule_applied, assigned_by, now
+            ))
 
-        conn.execute("COMMIT")
-        return {
-            "rehab_active_id": rehab_active_id,
-            "waitlist_id": waitlist_id,
-            "patient_id": patient_id,
-            "priority_level": priority_level,
-            "specialty": specialty,
-            "subspecialty": subspecialty,
-            "wait_days": int(wait_days),
-            "rule_applied": rule_applied,
-            "request_date": request_date,
-        }
-
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+            return {
+                "rehab_active_id": rehab_active_id,
+                "waitlist_id": waitlist_id,
+                "patient_id": patient_id,
+                "priority_level": priority_level,
+                "specialty": specialty,
+                "subspecialty": subspecialty,
+                "wait_days": int(wait_days),
+                "rule_applied": rule_applied,
+                "request_date": request_date.isoformat() if hasattr(request_date, "isoformat") else str(request_date),
+            }
 
 
 def discharge_patient(conn, rehab_active_id: int, reason: str, actor: str = "CLINICO"):
     now = now_iso()
-    cur = conn.cursor()
 
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        cur.execute("""
-            SELECT id, patient_id, specialty, subspecialty
-            FROM rehab_active
-            WHERE id=? AND status='ACTIVE'
-        """, (rehab_active_id,))
-        row = cur.fetchone()
-        if not row:
-            conn.execute("ROLLBACK")
-            return False
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, patient_id, specialty, subspecialty
+                FROM rehab_active
+                WHERE id=%s AND status='ACTIVE'
+            """, (rehab_active_id,))
+            row = cur.fetchone()
 
-        _, patient_id, specialty, subspecialty = row
+            if not row:
+                return False
 
-        cur.execute("""
-            UPDATE rehab_active
-            SET status='DISCHARGED',
-                discharge_reason=?,
-                discharged_at=?
-            WHERE id=? AND status='ACTIVE'
-        """, (reason, now, rehab_active_id))
+            _, patient_id, specialty, subspecialty = row
 
-        cur.execute("""
-            INSERT INTO assignment_log
-                (event, waitlist_id, rehab_active_id, patient_id, specialty, subspecialty, chosen_priority_level, wait_days, rule_applied, reason, actor, created_at)
-            VALUES
-                ('DISCHARGE', NULL, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)
-        """, (rehab_active_id, patient_id, specialty, subspecialty, reason, actor, now))
+            cur.execute("""
+                UPDATE rehab_active
+                SET status='DISCHARGED',
+                    discharge_reason=%s,
+                    discharged_at=%s
+                WHERE id=%s AND status='ACTIVE'
+            """, (reason, now, rehab_active_id))
 
-        conn.execute("COMMIT")
-        return True
+            cur.execute("""
+                INSERT INTO assignment_log
+                    (event, waitlist_id, rehab_active_id, patient_id, specialty, subspecialty,
+                     chosen_priority_level, wait_days, rule_applied, reason, actor, created_at)
+                VALUES
+                    ('DISCHARGE', NULL, %s, %s, %s, %s, NULL, NULL, NULL, %s, %s, %s)
+            """, (rehab_active_id, patient_id, specialty, subspecialty, reason, actor, now))
 
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+            return True
 
 
 def get_stats(conn):
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM waitlist WHERE status='WAITING' AND eligible=1")
-    waiting = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM rehab_active WHERE status='ACTIVE'")
-    active = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM rehab_active WHERE status='DISCHARGED'")
-    discharged = cur.fetchone()[0]
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM waitlist WHERE status='WAITING' AND eligible=TRUE")
+        waiting = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM rehab_active WHERE status='ACTIVE'")
+        active = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM rehab_active WHERE status='DISCHARGED'")
+        discharged = cur.fetchone()[0]
+
     return waiting, active, discharged
 
 
@@ -382,8 +399,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-conn = get_conn()
-init_db(conn)
+try:
+    conn = get_conn()
+    init_db(conn)
+except Exception as e:
+    st.error(f"Error conectando con la base de datos cloud: {e}")
+    st.stop()
 
 # Sidebar
 st.sidebar.markdown("## 🏥 Tratamiento Fisioterapia")
@@ -395,7 +416,6 @@ page = st.sidebar.radio(
 )
 st.sidebar.markdown("---")
 
-# --- BUG FIX: keys únicas en sidebar ---
 specialty_filter = st.sidebar.selectbox(
     "Filtro por especialidad",
     ["Todas"] + SPECIALTIES,
@@ -466,7 +486,6 @@ if page == "Dashboard":
                 key="dash_specialty"
             )
 
-        # subspecialty en tabla solo si Cinesiterapia
         ss_filter_table = "Todas"
         if sp_filter == "Cinesiterapia":
             ss_filter_table = st.selectbox(
@@ -479,18 +498,18 @@ if page == "Dashboard":
         params = [now]
 
         if elig_filter == "Solo elegibles":
-            where.append("eligible=1")
+            where.append("eligible=TRUE")
 
         if pr_filter != "Todas":
-            where.append("priority_level=?")
+            where.append("priority_level=%s")
             params.append(pr_filter)
 
         if sp_filter != "Todas":
-            where.append("specialty=?")
+            where.append("specialty=%s")
             params.append(sp_filter)
 
             if sp_filter == "Cinesiterapia" and ss_filter_table != "Todas":
-                where.append("subspecialty=?")
+                where.append("subspecialty=%s")
                 params.append(ss_filter_table)
 
         where_sql = " AND ".join(where)
@@ -503,7 +522,7 @@ if page == "Dashboard":
                 specialty,
                 subspecialty,
                 request_date,
-                CAST((julianday(?) - julianday(request_date)) AS INTEGER) AS wait_days,
+                FLOOR(EXTRACT(EPOCH FROM (%s::timestamptz - request_date)) / 86400)::INTEGER AS wait_days,
                 eligible
             FROM waitlist
             WHERE {where_sql}
@@ -515,6 +534,8 @@ if page == "Dashboard":
             d = dict(zip(cols, r))
             d["priority_level"] = priority_badge(d["priority_level"])
             d["specialty"] = specialty_label(d["specialty"], d.get("subspecialty"))
+            if hasattr(d["request_date"], "isoformat"):
+                d["request_date"] = d["request_date"].isoformat()
             d.pop("subspecialty", None)
             data.append(d)
 
@@ -566,9 +587,6 @@ if page == "Dashboard":
 elif page == "Nueva solicitud":
     st.subheader("➕ Nueva solicitud de rehabilitación")
 
-    # Mantiene el mismo formato visual (misma fila de columnas),
-    # pero SIN st.form para que el selector de Área se actualice al instante.
-
     c1, c2, c3, c4, c5 = st.columns([1.1, 1, 1.3, 1.3, 1], gap="large")
 
     with c1:
@@ -612,7 +630,6 @@ elif page == "Nueva solicitud":
 
     eligible = st.checkbox("Elegible", value=True, key="req_eligible")
 
-    # Botón igual que antes (abajo, ancho completo)
     if st.button("Guardar solicitud", width="stretch", key="req_submit"):
         if not patient_id.strip():
             st.error("Introduce un ID de paciente.")
@@ -642,6 +659,10 @@ elif page == "Tratamiento activo":
     for r in rows:
         d = dict(zip(cols, r))
         d["specialty"] = specialty_label(d["specialty"], d.get("subspecialty"))
+        if hasattr(d["start_date"], "isoformat"):
+            d["start_date"] = d["start_date"].isoformat()
+        if hasattr(d["assigned_at"], "isoformat"):
+            d["assigned_at"] = d["assigned_at"].isoformat()
         d.pop("subspecialty", None)
         data.append(d)
     st.dataframe(data, width="stretch", hide_index=True)
@@ -658,6 +679,10 @@ elif page == "Tratamiento activo":
     for r in rows:
         d = dict(zip(cols, r))
         d["specialty"] = specialty_label(d["specialty"], d.get("subspecialty"))
+        if hasattr(d["start_date"], "isoformat"):
+            d["start_date"] = d["start_date"].isoformat()
+        if hasattr(d["discharged_at"], "isoformat"):
+            d["discharged_at"] = d["discharged_at"].isoformat()
         d.pop("subspecialty", None)
         data.append(d)
     st.dataframe(data, width="stretch", hide_index=True)
@@ -675,8 +700,10 @@ elif page == "Auditoría":
     for r in rows:
         d = dict(zip(cols, r))
         d["specialty"] = specialty_label(d["specialty"], d.get("subspecialty"))
+        if hasattr(d["created_at"], "isoformat"):
+            d["created_at"] = d["created_at"].isoformat()
         d.pop("subspecialty", None)
         data.append(d)
     st.dataframe(data, width="stretch", hide_index=True)
 
-st.caption("Consejo: si cambias el esquema, usa un DB_PATH nuevo para evitar conflictos con tablas antiguas.")
+st.caption("Consejo: usa PostgreSQL cloud con DATABASE_URL y guarda las credenciales en Secrets, no en el código.")
