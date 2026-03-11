@@ -28,6 +28,7 @@ DAYS_6_MONTHS = 183
 
 
 # -------------------- DB helpers --------------------
+from urllib.parse import urlsplit
 def get_database_url() -> str:
     db_url = st.secrets.get("DATABASE_URL", None)
     if not db_url:
@@ -38,6 +39,11 @@ def get_database_url() -> str:
             "No se ha encontrado DATABASE_URL. "
             "Configúrala en .streamlit/secrets.toml o como variable de entorno."
         )
+
+    parts = urlsplit(db_url)
+    st.write("DEBUG host:", parts.hostname)
+    st.write("DEBUG user:", parts.username)
+
     return db_url
 
 
