@@ -10,8 +10,8 @@ import streamlit as st
 
 
 # -------------------- Config --------------------
-SPECIALTIES = ["Electroterapia", "Terapia ocupacional", "Logopedia", "Cinesiterapia"]
-CINESITERAPIA_SUBSPECIALTIES = [
+ESPECIALIDADES = ["Electroterapia", "Terapia ocupacional", "Logopedia", "Cinesiterapia"]
+SUBESPECIALIDADES_CINESITERAPIA = [
     "Linfedema",
     "Suelo pélvico",
     "Infantil",
@@ -21,11 +21,11 @@ CINESITERAPIA_SUBSPECIALTIES = [
     "Columna/raquis",
     "General",
 ]
-PRIORITIES = ["urgente", "preferente", "ordinario"]
+PRIORIDADES = ["urgente", "preferente", "ordinario"]
 
-DAYS_2_MONTHS = 60
-DAYS_3_MONTHS = 90
-DAYS_6_MONTHS = 183
+DIAS_2_MESES = 60
+DIAS_3_MESES = 90
+DIAS_6_MESES = 183
 
 
 # -------------------- DB helpers --------------------
@@ -51,6 +51,7 @@ def get_conn():
 
 def init_db(conn):
     with conn.cursor() as cur:
+        # -------------------- Tablas --------------------
         cur.execute("""
         CREATE TABLE IF NOT EXISTS waitlist (
             id BIGSERIAL PRIMARY KEY,
@@ -60,7 +61,7 @@ def init_db(conn):
             subspecialty TEXT,
             request_date TIMESTAMPTZ NOT NULL,
             created_at TIMESTAMPTZ NOT NULL,
-            status TEXT NOT NULL DEFAULT 'WAITING' CHECK(status IN ('WAITING','ASSIGNED','CANCELLED')),
+            status TEXT NOT NULL DEFAULT 'EN_ESPERA',
             eligible BOOLEAN NOT NULL DEFAULT TRUE
         );
         """)
@@ -75,12 +76,10 @@ def init_db(conn):
             source_waitlist_id BIGINT NOT NULL,
             assigned_by TEXT NOT NULL,
             assigned_at TIMESTAMPTZ NOT NULL,
-
-            status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','DISCHARGED')),
+            status TEXT NOT NULL DEFAULT 'ACTIVO',
             discharge_reason TEXT,
             discharge_comment TEXT,
             discharged_at TIMESTAMPTZ,
-
             FOREIGN KEY(source_waitlist_id) REFERENCES waitlist(id)
         );
         """)
@@ -104,9 +103,73 @@ def init_db(conn):
         );
         """)
 
-        # Por si las tablas ya existían de antes
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS treatment_sessions (
+            id BIGSERIAL PRIMARY KEY,
+            rehab_active_id BIGINT NOT NULL,
+            patient_id TEXT NOT NULL,
+            specialty TEXT NOT NULL,
+            subspecialty TEXT,
+            session_date DATE NOT NULL,
+            session_time TIME,
+            status TEXT NOT NULL,
+            absence_reason TEXT,
+            recorded_by TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            FOREIGN KEY(rehab_active_id) REFERENCES rehab_active(id)
+        );
+        """)
+
+        # -------------------- Columnas añadidas en versiones nuevas --------------------
         cur.execute("ALTER TABLE rehab_active ADD COLUMN IF NOT EXISTS discharge_comment TEXT;")
         cur.execute("ALTER TABLE assignment_log ADD COLUMN IF NOT EXISTS comment TEXT;")
+
+        # -------------------- Migración de constraints antiguos --------------------
+        # waitlist.status
+        cur.execute("ALTER TABLE waitlist DROP CONSTRAINT IF EXISTS waitlist_status_check;")
+        cur.execute("""
+            ALTER TABLE waitlist
+            ADD CONSTRAINT waitlist_status_check
+            CHECK (status IN ('EN_ESPERA','ASIGNADO','CANCELADO'));
+        """)
+
+        # rehab_active.status
+        cur.execute("ALTER TABLE rehab_active DROP CONSTRAINT IF EXISTS rehab_active_status_check;")
+        cur.execute("""
+            ALTER TABLE rehab_active
+            ADD CONSTRAINT rehab_active_status_check
+            CHECK (status IN ('ACTIVO','ALTA'));
+        """)
+
+        # treatment_sessions.status
+        cur.execute("ALTER TABLE treatment_sessions DROP CONSTRAINT IF EXISTS treatment_sessions_status_check;")
+        cur.execute("""
+            ALTER TABLE treatment_sessions
+            ADD CONSTRAINT treatment_sessions_status_check
+            CHECK (status IN ('REALIZADA', 'FALTA_JUSTIFICADA', 'FALTA_NO_JUSTIFICADA'));
+        """)
+
+        # -------------------- Valores antiguos -> nuevos --------------------
+        cur.execute("""
+            UPDATE waitlist
+            SET status = CASE
+                WHEN status = 'WAITING' THEN 'EN_ESPERA'
+                WHEN status = 'ASSIGNED' THEN 'ASIGNADO'
+                WHEN status = 'CANCELLED' THEN 'CANCELADO'
+                ELSE status
+            END
+            WHERE status IN ('WAITING', 'ASSIGNED', 'CANCELLED');
+        """)
+
+        cur.execute("""
+            UPDATE rehab_active
+            SET status = CASE
+                WHEN status = 'ACTIVE' THEN 'ACTIVO'
+                WHEN status = 'DISCHARGED' THEN 'ALTA'
+                ELSE status
+            END
+            WHERE status IN ('ACTIVE', 'DISCHARGED');
+        """)
 
 
 def fetch_all(conn, query, params=()):
@@ -125,7 +188,7 @@ def now_iso():
     return datetime.now(UTC).isoformat()
 
 
-# -------------------- Validación --------------------
+# -------------------- Validaciones --------------------
 def is_valid_dni(dni: str) -> bool:
     dni = dni.strip().upper()
     if not re.fullmatch(r"\d{8}[A-Z]", dni):
@@ -135,6 +198,11 @@ def is_valid_dni(dni: str) -> bool:
     numero = int(dni[:8])
     letra_correcta = letras[numero % 23]
     return dni[-1] == letra_correcta
+
+
+def is_valid_nhc(nhc: str) -> bool:
+    nhc = nhc.strip()
+    return bool(re.fullmatch(r"\d{6}", nhc))
 
 
 # -------------------- Business logic --------------------
@@ -151,26 +219,26 @@ def _selection_sql(where_extra: str = "") -> str:
                 request_date,
                 FLOOR(EXTRACT(EPOCH FROM (%s::timestamptz - request_date)) / 86400)::INTEGER AS wait_days
             FROM waitlist
-            WHERE status='WAITING' AND eligible=TRUE
+            WHERE status='EN_ESPERA' AND eligible=TRUE
             {extra}
         )
         SELECT
             id, patient_id, priority_level, specialty, subspecialty, request_date, wait_days,
             CASE
-              WHEN priority_level='preferente' AND wait_days >= {DAYS_2_MONTHS} THEN 'preferente>=2m_before_urgente'
-              WHEN priority_level='ordinario' AND wait_days >= {DAYS_6_MONTHS} THEN 'ordinario>=6m_before_urgente'
+              WHEN priority_level='preferente' AND wait_days >= {DIAS_2_MESES} THEN 'preferente_supera_2_meses'
+              WHEN priority_level='ordinario' AND wait_days >= {DIAS_6_MESES} THEN 'ordinario_supera_6_meses'
               WHEN priority_level='urgente' THEN 'urgente_base'
-              WHEN priority_level='ordinario' AND wait_days >= {DAYS_3_MONTHS} THEN 'ordinario>=3m_before_preferente'
+              WHEN priority_level='ordinario' AND wait_days >= {DIAS_3_MESES} THEN 'ordinario_supera_3_meses'
               WHEN priority_level='preferente' THEN 'preferente_base'
               ELSE 'ordinario_base'
             END AS rule_applied
         FROM candidates
         ORDER BY
             CASE
-                WHEN priority_level='preferente' AND wait_days >= {DAYS_2_MONTHS} THEN 0
-                WHEN priority_level='ordinario' AND wait_days >= {DAYS_6_MONTHS} THEN 0
+                WHEN priority_level='preferente' AND wait_days >= {DIAS_2_MESES} THEN 0
+                WHEN priority_level='ordinario' AND wait_days >= {DIAS_6_MESES} THEN 0
                 WHEN priority_level='urgente' THEN 1
-                WHEN priority_level='ordinario' AND wait_days >= {DAYS_3_MONTHS} THEN 2
+                WHEN priority_level='ordinario' AND wait_days >= {DIAS_3_MESES} THEN 2
                 WHEN priority_level='preferente' THEN 3
                 ELSE 4
             END ASC,
@@ -230,54 +298,6 @@ def preview_next_patient(conn, specialty_filter: str, subspecialty_filter: str):
     }
 
 
-def add_waiting_patient(
-    conn,
-    patient_id: str,
-    priority_level: str,
-    specialty: str,
-    subspecialty: str | None,
-    request_date_iso: str,
-    eligible: bool,
-    actor: str,
-):
-    created_at = now_iso()
-
-    if specialty != "Cinesiterapia":
-        subspecialty = None
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO waitlist (
-                patient_id, priority_level, specialty, subspecialty,
-                request_date, created_at, status, eligible
-            )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-            """,
-            (
-                patient_id,
-                priority_level,
-                specialty,
-                subspecialty,
-                request_date_iso,
-                created_at,
-                "WAITING",
-                eligible,
-            ),
-        )
-
-        cur.execute(
-            """
-            INSERT INTO assignment_log
-                (event, waitlist_id, rehab_active_id, patient_id, specialty, subspecialty,
-                 chosen_priority_level, wait_days, rule_applied, reason, comment, actor, created_at)
-            VALUES
-                ('MANUAL_ADD', NULL, NULL, %s, %s, %s, %s, NULL, NULL, NULL, NULL, %s, %s)
-            """,
-            (patient_id, specialty, subspecialty, priority_level, actor, created_at),
-        )
-
-
 def add_waiting_patient_multiple(
     conn,
     patient_id: str,
@@ -313,7 +333,7 @@ def add_waiting_patient_multiple(
                         subspecialty,
                         request_date_iso,
                         created_at,
-                        "WAITING",
+                        "EN_ESPERA",
                         eligible,
                     ),
                 )
@@ -324,13 +344,13 @@ def add_waiting_patient_multiple(
                         (event, waitlist_id, rehab_active_id, patient_id, specialty, subspecialty,
                          chosen_priority_level, wait_days, rule_applied, reason, comment, actor, created_at)
                     VALUES
-                        ('MANUAL_ADD', NULL, NULL, %s, %s, %s, %s, NULL, NULL, NULL, NULL, %s, %s)
+                        ('ALTA_MANUAL_LISTA_ESPERA', NULL, NULL, %s, %s, %s, %s, NULL, NULL, NULL, NULL, %s, %s)
                     """,
                     (patient_id, specialty, subspecialty, priority_level, actor, created_at),
                 )
 
 
-def assign_next_patient(conn, assigned_by="SYSTEM", specialty_filter="Todas", subspecialty_filter="Todas"):
+def assign_next_patient(conn, assigned_by="SISTEMA", specialty_filter="Todas", subspecialty_filter="Todas"):
     now = now_iso()
 
     with conn.transaction():
@@ -349,15 +369,15 @@ def assign_next_patient(conn, assigned_by="SYSTEM", specialty_filter="Todas", su
                 INSERT INTO rehab_active
                     (patient_id, specialty, subspecialty, start_date, source_waitlist_id, assigned_by, assigned_at, status)
                 VALUES
-                    (%s,%s,%s,%s,%s,%s,%s,'ACTIVE')
+                    (%s,%s,%s,%s,%s,%s,%s,'ACTIVO')
                 RETURNING id
             """, (patient_id, specialty, subspecialty, now, waitlist_id, assigned_by, now))
             rehab_active_id = cur.fetchone()[0]
 
             cur.execute("""
                 UPDATE waitlist
-                SET status='ASSIGNED'
-                WHERE id=%s AND status='WAITING'
+                SET status='ASIGNADO'
+                WHERE id=%s AND status='EN_ESPERA'
             """, (waitlist_id,))
 
             cur.execute("""
@@ -365,7 +385,7 @@ def assign_next_patient(conn, assigned_by="SYSTEM", specialty_filter="Todas", su
                     (event, waitlist_id, rehab_active_id, patient_id, specialty, subspecialty,
                      chosen_priority_level, wait_days, rule_applied, reason, comment, actor, created_at)
                 VALUES
-                    ('AUTO_ASSIGNMENT', %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, %s, %s)
+                    ('ASIGNACION_AUTOMATICA', %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, %s, %s)
             """, (
                 waitlist_id, rehab_active_id, patient_id, specialty, subspecialty,
                 priority_level, int(wait_days), rule_applied, assigned_by, now
@@ -392,7 +412,7 @@ def discharge_patient(conn, rehab_active_id: int, reason: str, comment: str, act
             cur.execute("""
                 SELECT id, patient_id, specialty, subspecialty
                 FROM rehab_active
-                WHERE id=%s AND status='ACTIVE'
+                WHERE id=%s AND status='ACTIVO'
             """, (rehab_active_id,))
             row = cur.fetchone()
 
@@ -403,11 +423,11 @@ def discharge_patient(conn, rehab_active_id: int, reason: str, comment: str, act
 
             cur.execute("""
                 UPDATE rehab_active
-                SET status='DISCHARGED',
+                SET status='ALTA',
                     discharge_reason=%s,
                     discharge_comment=%s,
                     discharged_at=%s
-                WHERE id=%s AND status='ACTIVE'
+                WHERE id=%s AND status='ACTIVO'
             """, (reason, comment, now, rehab_active_id))
 
             cur.execute("""
@@ -415,21 +435,82 @@ def discharge_patient(conn, rehab_active_id: int, reason: str, comment: str, act
                     (event, waitlist_id, rehab_active_id, patient_id, specialty, subspecialty,
                      chosen_priority_level, wait_days, rule_applied, reason, comment, actor, created_at)
                 VALUES
-                    ('DISCHARGE', NULL, %s, %s, %s, %s, NULL, NULL, NULL, %s, %s, %s, %s)
+                    ('ALTA_TRATAMIENTO', NULL, %s, %s, %s, %s, NULL, NULL, NULL, %s, %s, %s, %s)
             """, (rehab_active_id, patient_id, specialty, subspecialty, reason, comment, actor, now))
 
             return True
 
 
+def add_treatment_session(
+    conn,
+    rehab_active_id: int,
+    patient_id: str,
+    specialty: str,
+    subspecialty: str | None,
+    session_date_value: date,
+    session_time_value,
+    status: str,
+    absence_reason: str,
+    recorded_by: str,
+):
+    created_at = now_iso()
+
+    if status == "REALIZADA":
+        absence_reason = None
+    elif not absence_reason.strip():
+        absence_reason = "Sin especificar"
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO treatment_sessions
+                (rehab_active_id, patient_id, specialty, subspecialty, session_date, session_time,
+                 status, absence_reason, recorded_by, created_at)
+            VALUES
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            rehab_active_id,
+            patient_id,
+            specialty,
+            subspecialty,
+            session_date_value,
+            session_time_value,
+            status,
+            absence_reason,
+            recorded_by,
+            created_at
+        ))
+
+
+def get_treatment_sessions(conn, rehab_active_id: int):
+    cols, rows = fetch_all(conn, """
+        SELECT
+            id,
+            rehab_active_id,
+            patient_id,
+            specialty,
+            subspecialty,
+            session_date,
+            session_time,
+            status,
+            absence_reason,
+            recorded_by,
+            created_at
+        FROM treatment_sessions
+        WHERE rehab_active_id = %s
+        ORDER BY session_date DESC, session_time DESC NULLS LAST, id DESC
+    """, (rehab_active_id,))
+    return cols, rows
+
+
 def get_stats(conn):
     with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM waitlist WHERE status='WAITING' AND eligible=TRUE")
+        cur.execute("SELECT COUNT(*) FROM waitlist WHERE status='EN_ESPERA' AND eligible=TRUE")
         waiting = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM rehab_active WHERE status='ACTIVE'")
+        cur.execute("SELECT COUNT(*) FROM rehab_active WHERE status='ACTIVO'")
         active = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM rehab_active WHERE status='DISCHARGED'")
+        cur.execute("SELECT COUNT(*) FROM rehab_active WHERE status='ALTA'")
         discharged = cur.fetchone()[0]
 
     return waiting, active, discharged
@@ -447,6 +528,16 @@ def specialty_label(specialty: str, subspecialty: str | None) -> str:
     if specialty == "Cinesiterapia" and subspecialty:
         return f"{specialty} · {subspecialty}"
     return specialty
+
+
+def estado_sesion_label(status: str) -> str:
+    if status == "REALIZADA":
+        return "Realizada"
+    if status == "FALTA_JUSTIFICADA":
+        return "Falta justificada"
+    if status == "FALTA_NO_JUSTIFICADA":
+        return "Falta no justificada"
+    return status
 
 
 # -------------------- UI --------------------
@@ -469,14 +560,14 @@ try:
     conn = get_conn()
     init_db(conn)
 except Exception as e:
-    st.error(f"Error conectando con la base de datos cloud: {e}")
+    st.error(f"Error conectando con la base de datos en la nube: {e}")
     st.stop()
 
 # Sidebar
 st.sidebar.markdown("## 🏥 Tratamiento Fisioterapia")
 page = st.sidebar.radio(
     "Navegación",
-    ["Dashboard", "Nueva solicitud", "Tratamiento activo", "Auditoría"],
+    ["Panel clínico", "Nueva solicitud", "Tratamiento activo", "Auditoría"],
     index=0,
     key="nav_page"
 )
@@ -484,18 +575,22 @@ st.sidebar.markdown("---")
 
 specialty_filter = st.sidebar.selectbox(
     "Filtro por especialidad",
-    ["Todas"] + SPECIALTIES,
+    ["Todas"] + ESPECIALIDADES,
     key="sidebar_specialty_filter"
 )
 subspecialty_filter = "Todas"
 if specialty_filter == "Cinesiterapia":
     subspecialty_filter = st.sidebar.selectbox(
         "Área (Cinesiterapia)",
-        ["Todas"] + CINESITERAPIA_SUBSPECIALTIES,
+        ["Todas"] + SUBESPECIALIDADES_CINESITERAPIA,
         key="sidebar_cinesi_area_filter"
     )
 
-actor_sidebar = st.sidebar.text_input("DNI", value="", key="sidebar_actor").strip().upper()
+actor_sidebar = st.sidebar.text_input(
+    "DNI del clínico (opcional en nueva solicitud)",
+    value="",
+    key="sidebar_actor"
+).strip().upper()
 
 if actor_sidebar and not is_valid_dni(actor_sidebar):
     st.sidebar.error("Introduce un DNI válido. Ejemplo: 12345678Z")
@@ -514,7 +609,7 @@ st.write("")
 # KPI cards
 c1, c2, c3, c4 = st.columns([1, 1, 1, 2], gap="large")
 with c1:
-    st.markdown(f"<div class='kpi-card'><div class='muted'>En espera (eligibles)</div><div style='font-size:28px;font-weight:700'>{waiting}</div></div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='kpi-card'><div class='muted'>En espera (elegibles)</div><div style='font-size:28px;font-weight:700'>{waiting}</div></div>", unsafe_allow_html=True)
 with c2:
     st.markdown(f"<div class='kpi-card'><div class='muted'>En tratamiento</div><div style='font-size:28px;font-weight:700'>{active}</div></div>", unsafe_allow_html=True)
 with c3:
@@ -524,7 +619,7 @@ with c4:
     if nxt:
         st.markdown("<div class='kpi-card'>", unsafe_allow_html=True)
         st.markdown("**Siguiente candidato (con filtros)**")
-        st.write(f"Paciente: **{nxt['patient_id']}** · {priority_badge(nxt['priority_level'])}")
+        st.write(f"NHC: **{nxt['patient_id']}** · {priority_badge(nxt['priority_level'])}")
         st.write(f"Unidad: **{specialty_label(nxt['specialty'], nxt['subspecialty'])}**")
         st.write(f"Espera: **{nxt['wait_days']} días** · Solicitud: **{nxt['request_date'][:10]}**")
         st.caption(f"Regla aplicada: {nxt['rule_applied']}")
@@ -535,23 +630,23 @@ with c4:
 st.write("")
 
 # -------------------- Pages --------------------
-if page == "Dashboard":
+if page == "Panel clínico":
     left, right = st.columns([2.2, 1], gap="large")
 
     with left:
-        st.subheader("📋 Lista de espera (WAITING)")
+        st.subheader("📋 Lista de espera")
         now = now_iso()
 
         f1, f2, f3 = st.columns([1, 1, 1], gap="medium")
         with f1:
-            pr_filter = st.selectbox("Prioridad", ["Todas"] + PRIORITIES, key="dash_priority")
+            pr_filter = st.selectbox("Prioridad", ["Todas"] + PRIORIDADES, key="dash_priority")
         with f2:
             elig_filter = st.selectbox("Elegibilidad", ["Solo elegibles", "Todos"], key="dash_elig")
         with f3:
             sp_filter = st.selectbox(
                 "Especialidad (tabla)",
-                ["Todas"] + SPECIALTIES,
-                index=(0 if specialty_filter == "Todas" else (SPECIALTIES.index(specialty_filter) + 1)),
+                ["Todas"] + ESPECIALIDADES,
+                index=(0 if specialty_filter == "Todas" else (ESPECIALIDADES.index(specialty_filter) + 1)),
                 key="dash_specialty"
             )
 
@@ -559,11 +654,11 @@ if page == "Dashboard":
         if sp_filter == "Cinesiterapia":
             ss_filter_table = st.selectbox(
                 "Área (tabla - Cinesiterapia)",
-                ["Todas"] + CINESITERAPIA_SUBSPECIALTIES,
+                ["Todas"] + SUBESPECIALIDADES_CINESITERAPIA,
                 key="dash_cinesi_area"
             )
 
-        where = ["status='WAITING'"]
+        where = ["status='EN_ESPERA'"]
         params = [now]
 
         if elig_filter == "Solo elegibles":
@@ -601,10 +696,13 @@ if page == "Dashboard":
         data = []
         for r in rows:
             d = dict(zip(cols, r))
+            if "patient_id" in d:
+                d["NHC"] = d.pop("patient_id")
             d["priority_level"] = priority_badge(d["priority_level"])
             d["specialty"] = specialty_label(d["specialty"], d.get("subspecialty"))
             if hasattr(d["request_date"], "isoformat"):
                 d["request_date"] = d["request_date"].isoformat()
+            d["eligible"] = "Sí" if d.get("eligible") else "No"
             d.pop("subspecialty", None)
             data.append(d)
 
@@ -613,10 +711,10 @@ if page == "Dashboard":
     with right:
         st.subheader("⚙️ Acciones rápidas")
 
-        st.caption("Asignación automática (respeta reglas + desempates) usando los filtros laterales.")
+        st.caption("Asignación automática usando los filtros laterales.")
         if st.button("Asignar siguiente", width="stretch", key="btn_assign_next"):
             if not actor_sidebar:
-                st.error("Debes introducir un DNI.")
+                st.error("Debes introducir el DNI del clínico.")
             elif not is_valid_dni(actor_sidebar):
                 st.error("El DNI introducido no es válido.")
             else:
@@ -629,18 +727,18 @@ if page == "Dashboard":
                 if not res:
                     st.warning("No hay pacientes elegibles con esos filtros.")
                 else:
-                    st.success(f"Asignado: {res['patient_id']} ({res['priority_level']})")
+                    st.success(f"Asignado NHC: {res['patient_id']} ({res['priority_level']})")
                     st.info(
                         f"{specialty_label(res['specialty'], res['subspecialty'])} · {res['wait_days']} días · Regla: {res['rule_applied']}"
                     )
                     st.rerun()
 
         st.divider()
-        st.caption("Dar de alta/baja a un paciente activo para liberar plaza.")
+        st.caption("Dar alta a un NHC activo para liberar plaza.")
         colsA, rowsA = fetch_all(conn, """
             SELECT id, patient_id, specialty, subspecialty, start_date
             FROM rehab_active
-            WHERE status='ACTIVE'
+            WHERE status='ACTIVO'
             ORDER BY id DESC
         """)
         if not rowsA:
@@ -650,19 +748,21 @@ if page == "Dashboard":
                 f"{r[0]} · {r[1]} · {specialty_label(r[2], r[3])} · inicio {str(r[4])[:10]}": r[0]
                 for r in rowsA
             }
-            pick = st.selectbox("Paciente activo", list(options.keys()), key="dash_active_pick")
-            reason = st.selectbox("Motivo", ["FIN_TRATAMIENTO", "NO_ASISTE", "DERIVADO", "OTRO"], key="dash_discharge_reason")
+            pick = st.selectbox("NHC activo", list(options.keys()), key="dash_active_pick")
+            reason = st.selectbox("Motivo del alta", ["FIN_TRATAMIENTO", "NO_ASISTE", "DERIVADO", "OTRO"], key="dash_discharge_reason")
             comment = st.text_area(
                 "Comentario clínico",
                 placeholder="Escribe observaciones sobre el alta...",
                 key="dash_discharge_comment"
             )
 
-            if st.button("Dar alta/baja", width="stretch", key="btn_discharge"):
+            if st.button("Dar alta", width="stretch", key="btn_discharge"):
                 if not actor_sidebar:
-                    st.error("Debes introducir un DNI.")
+                    st.error("Debes introducir el DNI del clínico.")
                 elif not is_valid_dni(actor_sidebar):
                     st.error("El DNI introducido no es válido.")
+                elif reason == "OTRO" and not comment.strip():
+                    st.error("Debes añadir un comentario clínico cuando el motivo es OTRO.")
                 else:
                     ok = discharge_patient(
                         conn,
@@ -672,10 +772,10 @@ if page == "Dashboard":
                         actor=actor_sidebar
                     )
                     if ok:
-                        st.success("Alta/Baja registrada.")
+                        st.success("Alta registrada.")
                         st.rerun()
                     else:
-                        st.error("No se pudo registrar (quizá ya no estaba ACTIVE).")
+                        st.error("No se pudo registrar el alta.")
 
 elif page == "Nueva solicitud":
     st.subheader("➕ Nueva solicitud de rehabilitación")
@@ -684,15 +784,15 @@ elif page == "Nueva solicitud":
 
     with c1:
         patient_id = st.text_input(
-            "ID paciente",
-            placeholder="Ej: P001",
+            "NHC del paciente",
+            placeholder="Ej: 123456",
             key="req_patient_id"
-        )
+        ).strip()
 
     with c2:
         priority_level = st.selectbox(
             "Prioridad",
-            PRIORITIES,
+            PRIORIDADES,
             key="req_priority"
         )
 
@@ -708,7 +808,7 @@ elif page == "Nueva solicitud":
 
     selected_specialties = st.multiselect(
         "Especialidades",
-        SPECIALTIES,
+        ESPECIALIDADES,
         key="req_specialties_multi"
     )
 
@@ -716,7 +816,7 @@ elif page == "Nueva solicitud":
     if "Cinesiterapia" in selected_specialties:
         cinesi_subspecialties = st.multiselect(
             "Áreas de Cinesiterapia",
-            CINESITERAPIA_SUBSPECIALTIES,
+            SUBESPECIALIDADES_CINESITERAPIA,
             key="req_cinesi_areas_multi"
         )
         st.caption("Si seleccionas Cinesiterapia, debes indicar al menos un área.")
@@ -724,12 +824,10 @@ elif page == "Nueva solicitud":
     st.caption("Se creará una solicitud independiente por cada especialidad seleccionada. En Cinesiterapia, una por cada área seleccionada.")
 
     if st.button("Guardar solicitud", width="stretch", key="req_submit"):
-        if not patient_id.strip():
-            st.error("Introduce un ID de paciente.")
-        elif not actor_sidebar:
-            st.error("Debes introducir un DNI.")
-        elif not is_valid_dni(actor_sidebar):
-            st.error("El DNI introducido no es válido.")
+        if not patient_id:
+            st.error("Introduce el NHC del paciente.")
+        elif not is_valid_nhc(patient_id):
+            st.error("El NHC debe tener exactamente 6 números.")
         elif not selected_specialties:
             st.error("Selecciona al menos una especialidad.")
         else:
@@ -752,30 +850,34 @@ elif page == "Nueva solicitud":
                         "subspecialty": None
                     })
 
+            actor_para_guardar = actor_sidebar if actor_sidebar and is_valid_dni(actor_sidebar) else "SIN_DNI"
+
             add_waiting_patient_multiple(
                 conn,
-                patient_id=patient_id.strip(),
+                patient_id=patient_id,
                 priority_level=priority_level,
                 requests=requests,
                 request_date_iso=iso_utc_from_date(request_dt),
                 eligible=eligible,
-                actor=actor_sidebar
+                actor=actor_para_guardar
             )
 
-            st.success(f"Solicitud guardada. Se han creado {len(requests)} entradas.")
+            st.success(f"Solicitud guardada para NHC {patient_id}. Se han creado {len(requests)} entradas.")
             st.rerun()
 
 elif page == "Tratamiento activo":
-    st.subheader("🧑‍⚕️ Pacientes en tratamiento (ACTIVE)")
+    st.subheader("🧑‍⚕️ NHC en tratamiento")
     cols, rows = fetch_all(conn, """
         SELECT id, patient_id, specialty, subspecialty, start_date, assigned_by, assigned_at
         FROM rehab_active
-        WHERE status='ACTIVE'
+        WHERE status='ACTIVO'
         ORDER BY id DESC
     """)
     data = []
     for r in rows:
         d = dict(zip(cols, r))
+        if "patient_id" in d:
+            d["NHC"] = d.pop("patient_id")
         d["specialty"] = specialty_label(d["specialty"], d.get("subspecialty"))
         if hasattr(d["start_date"], "isoformat"):
             d["start_date"] = d["start_date"].isoformat()
@@ -785,17 +887,130 @@ elif page == "Tratamiento activo":
         data.append(d)
     st.dataframe(data, width="stretch", hide_index=True)
 
-    st.subheader("📁 Historial (DISCHARGED)")
+    st.divider()
+    st.subheader("🗓️ Registro de sesiones por NHC")
+
+    colsA, rowsA = fetch_all(conn, """
+        SELECT id, patient_id, specialty, subspecialty, start_date
+        FROM rehab_active
+        WHERE status='ACTIVO'
+        ORDER BY id DESC
+    """)
+
+    if not rowsA:
+        st.info("No hay pacientes activos para registrar sesiones.")
+    else:
+        options = {
+            f"{r[0]} · {r[1]} · {specialty_label(r[2], r[3])} · inicio {str(r[4])[:10]}": {
+                "rehab_active_id": r[0],
+                "patient_id": r[1],
+                "specialty": r[2],
+                "subspecialty": r[3],
+                "start_date": r[4],
+            }
+            for r in rowsA
+        }
+
+        selected_label = st.selectbox(
+            "Selecciona NHC en tratamiento",
+            list(options.keys()),
+            key="session_patient_pick"
+        )
+        selected_patient = options[selected_label]
+
+        c1, c2, c3 = st.columns([1, 1, 1], gap="medium")
+
+        with c1:
+            session_date_value = st.date_input(
+                "Día del tratamiento",
+                value=date.today(),
+                key="session_date"
+            )
+
+        with c2:
+            session_time_value = st.time_input(
+                "Hora del tratamiento",
+                value=time(9, 0),
+                key="session_time"
+            )
+
+        with c3:
+            session_status = st.selectbox(
+                "Estado de la sesión",
+                ["REALIZADA", "FALTA_JUSTIFICADA", "FALTA_NO_JUSTIFICADA"],
+                format_func=estado_sesion_label,
+                key="session_status"
+            )
+
+        absence_reason = ""
+        if session_status != "REALIZADA":
+            absence_reason = st.text_area(
+                "Motivo de la falta",
+                placeholder="Ejemplo: enfermedad, cita médica, no acudió...",
+                key="session_absence_reason"
+            )
+            if session_status == "FALTA_NO_JUSTIFICADA":
+                st.warning("Esta falta quedará registrada como NO JUSTIFICADA.")
+
+        if st.button("Guardar sesión o falta", width="stretch", key="btn_save_session"):
+            if not actor_sidebar:
+                st.error("Debes introducir el DNI del clínico.")
+            elif not is_valid_dni(actor_sidebar):
+                st.error("El DNI introducido no es válido.")
+            elif session_status != "REALIZADA" and not absence_reason.strip():
+                st.error("Debes indicar el motivo de la falta.")
+            else:
+                add_treatment_session(
+                    conn=conn,
+                    rehab_active_id=selected_patient["rehab_active_id"],
+                    patient_id=selected_patient["patient_id"],
+                    specialty=selected_patient["specialty"],
+                    subspecialty=selected_patient["subspecialty"],
+                    session_date_value=session_date_value,
+                    session_time_value=session_time_value if session_status == "REALIZADA" else None,
+                    status=session_status,
+                    absence_reason=absence_reason.strip(),
+                    recorded_by=actor_sidebar
+                )
+                st.success("Registro guardado correctamente.")
+                st.rerun()
+
+        st.markdown("### Historial del NHC seleccionado")
+        sess_cols, sess_rows = get_treatment_sessions(conn, selected_patient["rehab_active_id"])
+
+        sess_data = []
+        for r in sess_rows:
+            d = dict(zip(sess_cols, r))
+            if "patient_id" in d:
+                d["NHC"] = d.pop("patient_id")
+            d["specialty"] = specialty_label(d["specialty"], d.get("subspecialty"))
+            if hasattr(d["session_date"], "isoformat"):
+                d["session_date"] = d["session_date"].isoformat()
+            d["session_time"] = str(d["session_time"])[:5] if d.get("session_time") is not None else ""
+            d["status"] = estado_sesion_label(d["status"])
+            if hasattr(d["created_at"], "isoformat"):
+                d["created_at"] = d["created_at"].isoformat()
+            d.pop("subspecialty", None)
+            sess_data.append(d)
+
+        if sess_data:
+            st.dataframe(sess_data, width="stretch", hide_index=True)
+        else:
+            st.info("Todavía no hay sesiones registradas para este NHC.")
+
+    st.subheader("📁 Historial de NHC dados de alta")
     cols, rows = fetch_all(conn, """
         SELECT id, patient_id, specialty, subspecialty, start_date, discharged_at, discharge_reason, discharge_comment
         FROM rehab_active
-        WHERE status='DISCHARGED'
+        WHERE status='ALTA'
         ORDER BY discharged_at DESC
         LIMIT 300
     """)
     data = []
     for r in rows:
         d = dict(zip(cols, r))
+        if "patient_id" in d:
+            d["NHC"] = d.pop("patient_id")
         d["specialty"] = specialty_label(d["specialty"], d.get("subspecialty"))
         if hasattr(d["start_date"], "isoformat"):
             d["start_date"] = d["start_date"].isoformat()
@@ -812,7 +1027,7 @@ elif page == "Auditoría":
     with f1:
         audit_pr_filter = st.selectbox(
             "Prioridad",
-            ["Todas"] + PRIORITIES,
+            ["Todas"] + PRIORIDADES,
             key="audit_priority"
         )
     with f2:
@@ -824,8 +1039,8 @@ elif page == "Auditoría":
     with f3:
         audit_sp_filter = st.selectbox(
             "Especialidad",
-            ["Todas"] + SPECIALTIES,
-            index=(0 if specialty_filter == "Todas" else (SPECIALTIES.index(specialty_filter) + 1)),
+            ["Todas"] + ESPECIALIDADES,
+            index=(0 if specialty_filter == "Todas" else (ESPECIALIDADES.index(specialty_filter) + 1)),
             key="audit_specialty"
         )
 
@@ -833,7 +1048,7 @@ elif page == "Auditoría":
     if audit_sp_filter == "Cinesiterapia":
         audit_ss_filter = st.selectbox(
             "Área (Cinesiterapia)",
-            ["Todas"] + CINESITERAPIA_SUBSPECIALTIES,
+            ["Todas"] + SUBESPECIALIDADES_CINESITERAPIA,
             key="audit_cinesi_area"
         )
 
@@ -887,6 +1102,8 @@ elif page == "Auditoría":
     data = []
     for r in rows:
         d = dict(zip(cols, r))
+        if "patient_id" in d:
+            d["NHC"] = d.pop("patient_id")
         d["specialty"] = specialty_label(d["specialty"], d.get("subspecialty"))
         if d.get("chosen_priority_level"):
             d["chosen_priority_level"] = priority_badge(d["chosen_priority_level"])
@@ -898,4 +1115,4 @@ elif page == "Auditoría":
 
     st.dataframe(data, width="stretch", hide_index=True)
 
-st.caption("Consejo: usa PostgreSQL cloud con DATABASE_URL y guarda las credenciales en Secrets, no en el código.")
+st.caption("Consejo: guarda las credenciales en Secrets y no dentro del código.")
