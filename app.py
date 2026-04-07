@@ -35,8 +35,6 @@ from validators import (
     validar_hora_sesion,
 )
 from services import (
-    acceso_configuracion_permitido,
-    cerrar_configuracion_si_sale,
     preview_next_patient,
     add_waiting_patient_multiple,
     assign_next_patient,
@@ -45,6 +43,8 @@ from services import (
     get_treatment_sessions,
     get_session_summary,
     get_stats,
+    delete_waitlist_entry,
+    delete_active_treatment,
 )
 from ui_helpers import (
     priority_badge,
@@ -53,6 +53,14 @@ from ui_helpers import (
     dia_semana_espanol,
     parse_attendance_days,
     render_mini_calendar,
+)
+from auth import (
+    init_auth_db,
+    ensure_admin_user,
+    authenticate_user,
+    create_user,
+    get_all_users,
+    PROFESIONES_DISPONIBLES,
 )
 
 # -------------------- UI --------------------
@@ -86,28 +94,61 @@ st.markdown("""
 try:
     conn = get_conn()
     init_db(conn)
+    init_auth_db(conn)
+    ensure_admin_user(conn)
 except Exception as e:
     st.error(f"Error conectando con la base de datos en la nube: {e}")
     st.stop()
+
+# -------------------- Login --------------------
+if "user" not in st.session_state:
+    st.session_state["user"] = None
+
+if st.session_state["user"] is None:
+    st.markdown("## Acceso al sistema")
+
+    username_login = st.text_input("Usuario", key="login_username")
+    password_login = st.text_input("Contraseña", type="password", key="login_password")
+
+    if st.button("Iniciar sesión", key="login_button"):
+        user = authenticate_user(conn, username_login.strip(), password_login)
+        if user:
+            st.session_state["user"] = user
+            st.success("Acceso correcto.")
+            st.rerun()
+        else:
+            st.error("Usuario o contraseña incorrectos.")
+
+    st.info("Usuario inicial: admin · Contraseña inicial: Admin1234")
+    st.stop()
+
+usuario_actual = st.session_state["user"]
+actor_sidebar = usuario_actual["dni"]
+rol_usuario = usuario_actual["role"]
+nombre_usuario = usuario_actual["full_name"]
+profesion_usuario = usuario_actual["profession"]
 
 especialidades_activas = get_nombres_especialidades(conn, only_active=True)
 
 # -------------------- Sidebar --------------------
 st.sidebar.markdown("## 🏥 Tratamiento Fisioterapia")
+
+paginas = [
+    "📊 Panel de control",
+    "📝 Nueva solicitud",
+    "⚕️ Tratamientos activos",
+    "🧾 Auditoría clínica",
+]
+
+if rol_usuario == "ADMIN":
+    paginas.append("⚙️ Ajustes")
+
 page = st.sidebar.radio(
     "Secciones",
-    [
-        "📊 Panel de control",
-        "📝 Nueva solicitud",
-        "⚕️ Tratamientos activos",
-        "🧾 Auditoría clínica",
-        "⚙️ Ajustes",
-    ],
+    paginas,
     index=0,
     key="nav_page"
 )
-
-cerrar_configuracion_si_sale(page)
 
 st.sidebar.markdown("---")
 
@@ -126,14 +167,14 @@ if specialty_filter != "Todas" and specialty_requires_subspecialty(conn, special
         key="sidebar_area_filter"
     )
 
-actor_sidebar = st.sidebar.text_input(
-    "DNI del clínico (opcional en nueva solicitud)",
-    value="",
-    key="sidebar_actor"
-).strip().upper()
+st.sidebar.markdown(f"**Usuario:** {nombre_usuario}")
+st.sidebar.markdown(f"**DNI:** {actor_sidebar}")
+st.sidebar.markdown(f"**Profesión:** {profesion_usuario}")
+st.sidebar.markdown(f"**Rol:** {rol_usuario}")
 
-if actor_sidebar and not is_valid_dni(actor_sidebar):
-    st.sidebar.error("Introduce un DNI válido. Ejemplo: 12345678Z")
+if st.sidebar.button("Cerrar sesión", key="logout_button"):
+    st.session_state["user"] = None
+    st.rerun()
 
 # -------------------- Cabecera --------------------
 waiting, active, discharged = get_stats(conn)
@@ -263,11 +304,7 @@ if page == "📊 Panel de control":
         )
 
         if st.button("Asignar siguiente", width="stretch", key="btn_assign_next"):
-            if not actor_sidebar:
-                st.error("Debes introducir el DNI del clínico.")
-            elif not is_valid_dni(actor_sidebar):
-                st.error("El DNI introducido no es válido.")
-            elif not attendance_days:
+            if not attendance_days:
                 st.error("Debes seleccionar al menos un día de asistencia.")
             else:
                 try:
@@ -324,11 +361,7 @@ if page == "📊 Panel de control":
             )
 
             if st.button("Dar alta", width="stretch", key="btn_discharge"):
-                if not actor_sidebar:
-                    st.error("Debes introducir el DNI del clínico.")
-                elif not is_valid_dni(actor_sidebar):
-                    st.error("El DNI introducido no es válido.")
-                elif reason == "OTRO" and not comment.strip():
+                if reason == "OTRO" and not comment.strip():
                     st.error("Debes añadir un comentario clínico cuando el motivo es OTRO.")
                 else:
                     ok = discharge_patient(
@@ -490,8 +523,6 @@ elif page == "📝 Nueva solicitud":
                         if sesiones_por_especialidad.get(sp) else None
                     })
 
-            actor_para_guardar = actor_sidebar if actor_sidebar and is_valid_dni(actor_sidebar) else "SIN_DNI"
-
             add_waiting_patient_multiple(
                 conn,
                 patient_id=patient_id,
@@ -499,7 +530,7 @@ elif page == "📝 Nueva solicitud":
                 requests=requests,
                 request_date_iso=iso_utc_from_date(request_dt),
                 eligible=eligible,
-                actor=actor_para_guardar,
+                actor=actor_sidebar,
                 slot_type=slot_type,
                 time_preference=time_preference,
                 transport_mode=transport_mode,
@@ -633,11 +664,7 @@ elif page == "⚕️ Tratamientos activos":
             error_hora = validar_hora_sesion(selected_patient, session_time_value)
 
         if st.button("Guardar sesión o falta", width="stretch", key="btn_save_session"):
-            if not actor_sidebar:
-                st.error("Debes introducir el DNI del clínico.")
-            elif not is_valid_dni(actor_sidebar):
-                st.error("El DNI introducido no es válido.")
-            elif session_status in ["FALTA_JUSTIFICADA", "FALTA_NO_JUSTIFICADA"] and not absence_reason.strip():
+            if session_status in ["FALTA_JUSTIFICADA", "FALTA_NO_JUSTIFICADA"] and not absence_reason.strip():
                 st.error("Debes indicar el motivo de la falta.")
             elif fuera_de_dias and not out_of_schedule_reason.strip():
                 st.error("Debes indicar el motivo por el que se registra fuera de los días establecidos.")
@@ -785,10 +812,160 @@ elif page == "🧾 Auditoría clínica":
     st.dataframe(data, width="stretch", hide_index=True)
 
 elif page == "⚙️ Ajustes":
-    if not acceso_configuracion_permitido():
+
+    if rol_usuario != "ADMIN":
+        st.error("No tienes permisos para acceder a Ajustes.")
         st.stop()
 
     st.subheader("⚙️ Ajustes del sistema")
+
+    st.markdown("### Corrección de errores de registro")
+
+    with st.expander("🚫 Eliminar solicitud de lista de espera"):
+        _, waitlist_rows = fetch_all(conn, """
+            SELECT id, patient_id, specialty, subspecialty, priority_level, request_date
+            FROM waitlist
+            ORDER BY id DESC
+            LIMIT 300
+        """)
+
+        if not waitlist_rows:
+            st.info("No hay solicitudes en lista de espera.")
+        else:
+            waitlist_options = {
+                f"{r[0]} · NHC {r[1]} · {specialty_label(r[2], r[3])} · {r[4]} · {str(r[5])[:10]}": r[0]
+                for r in waitlist_rows
+            }
+
+            selected_waitlist = st.selectbox(
+                "Selecciona la solicitud a eliminar",
+                list(waitlist_options.keys()),
+                key="admin_delete_waitlist_pick"
+            )
+
+            confirm_delete_waitlist = st.checkbox(
+                "Confirmo que quiero eliminar esta solicitud",
+                key="admin_confirm_delete_waitlist"
+            )
+
+            if st.button("Eliminar solicitud", key="admin_delete_waitlist_button"):
+                if rol_usuario != "ADMIN":
+                    st.error("Solo el administrador puede eliminar solicitudes.")
+                elif not confirm_delete_waitlist:
+                    st.error("Debes confirmar la eliminación.")
+                else:
+                    ok, msg = delete_waitlist_entry(
+                        conn,
+                        waitlist_options[selected_waitlist],
+                        actor_sidebar
+                    )
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+    with st.expander("⛔ Eliminar tratamiento activo"):
+        _, active_rows = fetch_all(conn, """
+            SELECT id, patient_id, specialty, subspecialty, start_date
+            FROM rehab_active
+            WHERE status = 'ACTIVO'
+            ORDER BY id DESC
+            LIMIT 300
+        """)
+
+        if not active_rows:
+            st.info("No hay tratamientos activos.")
+        else:
+            active_options = {
+                f"{r[0]} · NHC {r[1]} · {specialty_label(r[2], r[3])} · inicio {str(r[4])[:10]}": r[0]
+                for r in active_rows
+            }
+
+            selected_active = st.selectbox(
+                "Selecciona el tratamiento activo a eliminar",
+                list(active_options.keys()),
+                key="admin_delete_active_pick"
+            )
+
+            confirm_delete_active = st.checkbox(
+                "Confirmo que quiero eliminar este tratamiento y sus sesiones",
+                key="admin_confirm_delete_active"
+            )
+
+            if st.button("Eliminar tratamiento", key="admin_delete_active_button"):
+                if rol_usuario != "ADMIN":
+                    st.error("Solo el administrador puede eliminar tratamientos.")
+                elif not confirm_delete_active:
+                    st.error("Debes confirmar la eliminación.")
+                else:
+                    ok, msg = delete_active_treatment(
+                        conn,
+                        active_options[selected_active],
+                        actor_sidebar
+                    )
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+    st.markdown("### Usuarios del sistema")
+
+    with st.expander("💉 Registrar nuevo clínico"):
+        u1, u2 = st.columns(2)
+        with u1:
+            new_username = st.text_input("Nombre de usuario", key="new_user_username")
+            new_full_name = st.text_input("Nombre completo", key="new_user_full_name")
+            new_dni = st.text_input("DNI", key="new_user_dni").strip().upper()
+        with u2:
+            new_profession = st.selectbox(
+                "Profesión",
+                PROFESIONES_DISPONIBLES,
+                key="new_user_profession"
+            )
+            new_password = st.text_input("Contraseña", type="password", key="new_user_password")
+            new_role = st.selectbox("Rol", ["ADMIN", "CLINICO"], key="new_user_role")
+
+        if st.button("Registrar usuario", key="create_user_button"):
+            if rol_usuario != "ADMIN":
+                st.error("Solo el administrador puede registrar usuarios.")
+            elif not new_username.strip():
+                st.error("Introduce un nombre de usuario.")
+            elif not new_full_name.strip():
+                st.error("Introduce el nombre completo.")
+            elif not is_valid_dni(new_dni):
+                st.error("El DNI no es válido.")
+            elif not new_password.strip():
+                st.error("Introduce una contraseña.")
+            else:
+                create_user(
+                    conn=conn,
+                    username=new_username.strip(),
+                    full_name=new_full_name.strip(),
+                    dni=new_dni,
+                    profession=new_profession,
+                    password=new_password,
+                    role=new_role
+                )
+                st.success("Usuario registrado correctamente.")
+                st.rerun()
+
+    st.markdown("### Listado de usuarios")
+    usuarios = get_all_users(conn)
+    data_users = []
+    for u in usuarios:
+        data_users.append({
+            "id": u[0],
+            "usuario": u[1],
+            "nombre": u[2],
+            "dni": u[3],
+            "profesión": u[4],
+            "rol": u[5],
+            "activo": "Sí" if u[6] else "No",
+            "creado": str(u[7])[:19],
+        })
+    st.dataframe(data_users, width="stretch", hide_index=True)
 
     tab1, tab2, tab3 = st.tabs(["Especialidades", "Áreas", "Listado actual"])
 

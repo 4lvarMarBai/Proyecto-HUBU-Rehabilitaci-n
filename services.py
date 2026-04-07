@@ -1,44 +1,10 @@
 # services.py
 
-import streamlit as st
+
 from datetime import datetime, UTC
 
 from database import fetch_all, execute_sql, now_iso
 from validators import validar_regla_coordinacion
-
-
-# -------------------- CONFIG ACCESS --------------------
-CLAVE_CONFIGURACION = "admin123"
-
-
-def acceso_configuracion_permitido() -> bool:
-    if "config_access_granted" not in st.session_state:
-        st.session_state["config_access_granted"] = False
-
-    clave = st.text_input(
-        "Introduce la contraseña de ajustes",
-        type="password",
-        key="config_password_input"
-    )
-
-    if st.button("Acceder", key="config_login_button"):
-        if clave == CLAVE_CONFIGURACION:
-            st.session_state["config_access_granted"] = True
-            st.rerun()
-        else:
-            st.error("Contraseña incorrecta.")
-
-    return st.session_state["config_access_granted"]
-
-
-def cerrar_configuracion_si_sale(page_actual: str):
-    if "ultima_page" not in st.session_state:
-        st.session_state["ultima_page"] = page_actual
-
-    if st.session_state["ultima_page"] == "⚙️ Ajustes" and page_actual != "⚙️ Ajustes":
-        st.session_state["config_access_granted"] = False
-
-    st.session_state["ultima_page"] = page_actual
 
 
 # -------------------- STATS --------------------
@@ -275,3 +241,98 @@ def get_session_summary(conn, rehab_active_id):
         resumen[s] = n
 
     return resumen
+
+def delete_waitlist_entry(conn, waitlist_id: int, actor: str):
+    """
+    Elimina una solicitud de lista de espera y deja constancia en auditoría.
+    Solo debe usarlo un ADMIN desde la interfaz.
+    """
+    now = now_iso()
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, patient_id, specialty, subspecialty, priority_level
+                FROM waitlist
+                WHERE id = %s
+            """, (waitlist_id,))
+            row = cur.fetchone()
+
+            if not row:
+                return False, "La solicitud no existe."
+
+            _, patient_id, specialty, subspecialty, priority_level = row
+
+            cur.execute("""
+                INSERT INTO assignment_log
+                    (event, waitlist_id, rehab_active_id, patient_id, specialty, subspecialty,
+                     chosen_priority_level, wait_days, rule_applied, reason, comment, actor, created_at)
+                VALUES
+                    ('ELIMINACION_ADMIN_LISTA_ESPERA', %s, NULL, %s, %s, %s, %s, NULL, NULL,
+                     'ELIMINADO_POR_ADMIN', 'Registro eliminado por administrador', %s, %s)
+            """, (
+                waitlist_id,
+                patient_id,
+                specialty,
+                subspecialty,
+                priority_level,
+                actor,
+                now
+            ))
+
+            cur.execute("""
+                DELETE FROM waitlist
+                WHERE id = %s
+            """, (waitlist_id,))
+
+    return True, "Solicitud eliminada correctamente."
+
+
+def delete_active_treatment(conn, rehab_active_id: int, actor: str):
+    """
+    Elimina un tratamiento activo y sus sesiones asociadas, dejando auditoría.
+    Solo debe usarlo un ADMIN.
+    """
+    now = now_iso()
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, patient_id, specialty, subspecialty
+                FROM rehab_active
+                WHERE id = %s
+            """, (rehab_active_id,))
+            row = cur.fetchone()
+
+            if not row:
+                return False, "El tratamiento no existe."
+
+            _, patient_id, specialty, subspecialty = row
+
+            cur.execute("""
+                INSERT INTO assignment_log
+                    (event, waitlist_id, rehab_active_id, patient_id, specialty, subspecialty,
+                     chosen_priority_level, wait_days, rule_applied, reason, comment, actor, created_at)
+                VALUES
+                    ('ELIMINACION_ADMIN_TRATAMIENTO', NULL, %s, %s, %s, %s, NULL, NULL, NULL,
+                     'ELIMINADO_POR_ADMIN', 'Tratamiento eliminado por administrador', %s, %s)
+            """, (
+                rehab_active_id,
+                patient_id,
+                specialty,
+                subspecialty,
+                actor,
+                now
+            ))
+
+            cur.execute("""
+                DELETE FROM treatment_sessions
+                WHERE rehab_active_id = %s
+            """, (rehab_active_id,))
+
+            cur.execute("""
+                DELETE FROM rehab_active
+                WHERE id = %s
+            """, (rehab_active_id,))
+
+    return True, "Tratamiento eliminado correctamente."
