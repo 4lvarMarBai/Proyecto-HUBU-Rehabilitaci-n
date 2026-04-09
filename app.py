@@ -60,7 +60,10 @@ from auth import (
     authenticate_user,
     create_user,
     get_all_users,
+    change_user_password,
+    reset_user_password_to_default,
     PROFESIONES_DISPONIBLES,
+    PASSWORD_TEMPORAL_POR_DEFECTO,
 )
 
 # -------------------- UI --------------------
@@ -119,9 +122,39 @@ if st.session_state["user"] is None:
         else:
             st.error("Usuario o contraseña incorrectos.")
 
-    st.info("Usuario inicial: admin · Contraseña inicial: Admin1234")
+    st.info("Usuario inicial administrador: admin · Contraseña inicial: Admin1234")
     st.stop()
 
+if st.session_state["user"].get("must_change_password"):
+    st.markdown("## Cambio obligatorio de contraseña")
+
+    st.warning("Es tu primer acceso o el administrador ha restablecido tu contraseña. Debes actualizarla para continuar.")
+
+    nueva_password_1 = st.text_input("Nueva contraseña", type="password", key="force_new_password_1")
+    nueva_password_2 = st.text_input("Repite la nueva contraseña", type="password", key="force_new_password_2")
+
+    if st.button("Actualizar contraseña", key="force_change_password_button"):
+        if not nueva_password_1.strip():
+            st.error("Introduce una nueva contraseña.")
+        elif len(nueva_password_1.strip()) < 8:
+            st.error("La nueva contraseña debe tener al menos 8 caracteres.")
+        elif nueva_password_1 != nueva_password_2:
+            st.error("Las contraseñas no coinciden.")
+        elif nueva_password_1 == PASSWORD_TEMPORAL_POR_DEFECTO:
+            st.error("La nueva contraseña no puede ser la contraseña temporal por defecto.")
+        else:
+            change_user_password(conn, st.session_state["user"]["id"], nueva_password_1.strip())
+            st.session_state["user"] = authenticate_user(
+                conn,
+                st.session_state["user"]["username"],
+                nueva_password_1.strip()
+            )
+            st.success("Contraseña actualizada correctamente.")
+            st.rerun()
+
+    st.stop()
+
+# -------------------- Variables de usuario y catálogos --------------------
 usuario_actual = st.session_state["user"]
 actor_sidebar = usuario_actual["dni"]
 rol_usuario = usuario_actual["role"]
@@ -819,6 +852,44 @@ elif page == "⚙️ Ajustes":
 
     st.subheader("⚙️ Ajustes del sistema")
 
+    st.markdown("### Restablecer contraseña de usuario")
+
+    usuarios_reset = get_all_users(conn)
+    usuarios_reset_options = {
+        f"{u[0]} · {u[1]} · {u[2]} · {u[3]} · {u[4]} · {u[5]}": u[0]
+        for u in usuarios_reset
+    }
+
+    if usuarios_reset_options:
+        selected_user_reset = st.selectbox(
+            "Selecciona el usuario al que quieres restablecer la contraseña",
+            list(usuarios_reset_options.keys()),
+            key="reset_user_select"
+        )
+
+        confirm_reset_password = st.checkbox(
+            f"Confirmo que quiero restablecer la contraseña a {PASSWORD_TEMPORAL_POR_DEFECTO}",
+            key="confirm_reset_password"
+        )
+
+        if st.button("Restablecer contraseña", key="reset_password_button"):
+            if rol_usuario != "ADMIN":
+                st.error("Solo el administrador puede restablecer contraseñas.")
+            elif not confirm_reset_password:
+                st.error("Debes confirmar el restablecimiento.")
+            else:
+                reset_user_password_to_default(
+                    conn,
+                    usuarios_reset_options[selected_user_reset]
+                )
+                st.success(
+                    f"Contraseña restablecida a {PASSWORD_TEMPORAL_POR_DEFECTO}. "
+                    "En el próximo acceso se obligará al usuario a cambiarla."
+                )
+                st.rerun()
+    else:
+        st.info("No hay usuarios disponibles para restablecer contraseña.")
+
     st.markdown("### Corrección de errores de registro")
 
     with st.expander("🚫 Eliminar solicitud de lista de espera"):
@@ -924,8 +995,8 @@ elif page == "⚙️ Ajustes":
                 PROFESIONES_DISPONIBLES,
                 key="new_user_profession"
             )
-            new_password = st.text_input("Contraseña", type="password", key="new_user_password")
             new_role = st.selectbox("Rol", ["ADMIN", "CLINICO"], key="new_user_role")
+            st.info(f"La contraseña inicial del usuario será: {PASSWORD_TEMPORAL_POR_DEFECTO}")
 
         if st.button("Registrar usuario", key="create_user_button"):
             if rol_usuario != "ADMIN":
@@ -936,8 +1007,6 @@ elif page == "⚙️ Ajustes":
                 st.error("Introduce el nombre completo.")
             elif not is_valid_dni(new_dni):
                 st.error("El DNI no es válido.")
-            elif not new_password.strip():
-                st.error("Introduce una contraseña.")
             else:
                 create_user(
                     conn=conn,
@@ -945,7 +1014,6 @@ elif page == "⚙️ Ajustes":
                     full_name=new_full_name.strip(),
                     dni=new_dni,
                     profession=new_profession,
-                    password=new_password,
                     role=new_role
                 )
                 st.success("Usuario registrado correctamente.")
@@ -962,8 +1030,9 @@ elif page == "⚙️ Ajustes":
             "dni": u[3],
             "profesión": u[4],
             "rol": u[5],
-            "activo": "Sí" if u[6] else "No",
-            "creado": str(u[7])[:19],
+            "cambio_clave_pendiente": "Sí" if u[6] else "No",
+            "activo": "Sí" if u[7] else "No",
+            "creado": str(u[8])[:19],
         })
     st.dataframe(data_users, width="stretch", hide_index=True)
 
@@ -1041,28 +1110,6 @@ elif page == "⚙️ Ajustes":
                     add_subspecialty_config(conn, especialidad_destino, nueva_area)
                     st.success("Área guardada.")
                     st.rerun()
-
-            st.markdown("### Activar o desactivar áreas")
-            for esp in especialidades_con_area:
-                st.markdown(f"**{esp}**")
-                areas = get_areas_por_especialidad(conn, esp, only_active=False)
-                if not areas:
-                    st.caption("Sin áreas registradas.")
-                else:
-                    for area_nombre, area_activa in areas:
-                        c1, c2 = st.columns([3, 1])
-                        with c1:
-                            st.write(area_nombre)
-                        with c2:
-                            nuevo_estado = st.toggle(
-                                "Activa",
-                                value=area_activa,
-                                key=f"toggle_area_{esp}_{area_nombre}",
-                                label_visibility="collapsed"
-                            )
-                            if nuevo_estado != area_activa:
-                                set_subspecialty_active(conn, esp, area_nombre, nuevo_estado)
-                                st.rerun()
 
     with tab3:
         st.markdown("### Especialidades")
