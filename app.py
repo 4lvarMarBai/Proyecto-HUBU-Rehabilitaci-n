@@ -8,7 +8,7 @@ import streamlit as st
 
 from config import (
     PRIORIDADES,
-    DIAS_SEMANA,
+    OPCIONES_ASISTENCIA,
     TIPOS_HUECO,
     TURNOS,
     TRANSPORTES,
@@ -330,41 +330,51 @@ if page == "📊 Panel de control":
         st.subheader("Acciones clínicas")
 
         st.caption("Asignación automática usando los filtros laterales.")
-        attendance_days = st.multiselect(
-            "Días de asistencia del tratamiento",
-            DIAS_SEMANA,
-            key="assign_attendance_days"
+        attendance_pattern = st.selectbox(
+            "Frecuencia del tratamiento",
+            ["LXV", "MJ", "LABORABLES"],
+            format_func=lambda x: {
+                "LXV": "Lunes, Miércoles y Viernes",
+                "MJ": "Martes y Jueves",
+                "LABORABLES": "Todos los días laborables",
+            }[x],
+            key="assign_attendance_pattern"
         )
 
-        if st.button("Asignar siguiente", width="stretch", key="btn_assign_next"):
-            if not attendance_days:
-                st.error("Debes seleccionar al menos un día de asistencia.")
-            else:
-                try:
-                    res = assign_next_patient(
-                        conn,
-                        assigned_by=actor_sidebar,
-                        specialty_filter=specialty_filter,
-                        subspecialty_filter=subspecialty_filter,
-                        attendance_days=attendance_days
-                    )
-                except ValueError as e:
-                    st.error(str(e))
-                    st.stop()
+        attendance_days = OPCIONES_ASISTENCIA[attendance_pattern]
 
-                if not res:
-                    st.warning("No hay pacientes elegibles con esos filtros.")
-                else:
-                    st.success(f"Asignado NHC: {res['patient_id']} ({res['priority_level']})")
-                    st.info(
-                        f"{specialty_label(res['specialty'], res['subspecialty'])} · "
-                        f"{res['wait_days']} días · Regla: {res['rule_applied']} · "
-                        f"Días: {', '.join(res['attendance_days'])} · "
-                        f"Hueco: {res['slot_type']} · Turno: {res['time_preference']} · "
-                        f"Transporte: {res['transport_mode']}" +
-                        (f" · Hora: {res['preferred_hour']}" if res['preferred_hour'] else "")
-                    )
-                    st.rerun()
+        if st.button("Asignar siguiente", width="stretch", key="btn_assign_next"):
+            try:
+                res = assign_next_patient(
+                    conn,
+                    assigned_by=actor_sidebar,
+                    assigned_clinician_dni=actor_sidebar,
+                    assigned_clinician_name=nombre_usuario,
+                    assigned_clinician_profession=profesion_usuario,
+                    specialty_filter=specialty_filter,
+                    subspecialty_filter=subspecialty_filter,
+                    attendance_days=attendance_days
+                )
+            except ValueError as e:
+                st.error(str(e))
+                st.stop()
+
+            if not res:
+                st.warning("No hay pacientes elegibles con esos filtros.")
+            else:
+                st.success(
+                    f"Asignado NHC: {res['patient_id']} ({res['priority_level']}) "
+                    f"al clínico {res['assigned_clinician_name']}"
+                )
+                st.info(
+                    f"{specialty_label(res['specialty'], res['subspecialty'])} · "
+                    f"{res['wait_days']} días de espera · "
+                    f"Regla: {res['rule_applied']} · "
+                    f"Frecuencia: {attendance_pattern} · "
+                    f"Clínico responsable: {res['assigned_clinician_name']} "
+                    f"({res['assigned_clinician_profession']})"
+                )
+                st.rerun()
 
         st.divider()
         st.caption("Formalización del alta de un tratamiento activo.")

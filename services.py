@@ -4,7 +4,7 @@
 from datetime import datetime, UTC
 
 from database import fetch_all, execute_sql, now_iso
-from validators import validar_regla_coordinacion
+from validators import validar_regla_coordinacion, validar_dias_asistencia
 
 
 # -------------------- STATS --------------------
@@ -94,23 +94,38 @@ def add_waiting_patient_multiple(
 
 
 # -------------------- ASSIGN --------------------
-def assign_next_patient(conn, assigned_by, specialty_filter, subspecialty_filter, attendance_days):
+def assign_next_patient(
+    conn,
+    assigned_by,
+    assigned_clinician_dni,
+    assigned_clinician_name,
+    assigned_clinician_profession,
+    specialty_filter,
+    subspecialty_filter,
+    attendance_days
+):
     now = now_iso()
 
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT id, patient_id, specialty, subspecialty
+            SELECT
+                id,
+                patient_id,
+                priority_level,
+                specialty,
+                subspecialty,
+                FLOOR(EXTRACT(EPOCH FROM (%s::timestamptz - request_date)) / 86400)::INTEGER AS wait_days
             FROM waitlist
-            WHERE status='EN_ESPERA'
+            WHERE status = 'EN_ESPERA'
             ORDER BY request_date ASC
             LIMIT 1
-        """)
+        """, (now,))
         row = cur.fetchone()
 
         if not row:
             return None
 
-        waitlist_id, patient_id, specialty, subspecialty = row
+        waitlist_id, patient_id, priority_level, specialty, subspecialty, wait_days = row
 
         error = validar_regla_coordinacion(
             conn,
@@ -125,11 +140,20 @@ def assign_next_patient(conn, assigned_by, specialty_filter, subspecialty_filter
 
         cur.execute("""
             INSERT INTO rehab_active (
-                patient_id, specialty, subspecialty,
-                attendance_days, start_date,
-                source_waitlist_id, assigned_by, assigned_at, status
+                patient_id,
+                specialty,
+                subspecialty,
+                attendance_days,
+                start_date,
+                source_waitlist_id,
+                assigned_by,
+                assigned_at,
+                assigned_clinician_dni,
+                assigned_clinician_name,
+                assigned_clinician_profession,
+                status
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'ACTIVO')
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'ACTIVO')
             RETURNING id
         """, (
             patient_id,
@@ -139,22 +163,32 @@ def assign_next_patient(conn, assigned_by, specialty_filter, subspecialty_filter
             now,
             waitlist_id,
             assigned_by,
-            now
+            now,
+            assigned_clinician_dni,
+            assigned_clinician_name,
+            assigned_clinician_profession,
         ))
 
         rehab_id = cur.fetchone()[0]
 
         cur.execute("""
             UPDATE waitlist
-            SET status='ASIGNADO'
-            WHERE id=%s
+            SET status = 'ASIGNADO'
+            WHERE id = %s
         """, (waitlist_id,))
 
     return {
+        "rehab_id": rehab_id,
         "patient_id": patient_id,
+        "priority_level": priority_level,
         "specialty": specialty,
         "subspecialty": subspecialty,
-        "attendance_days": attendance_days
+        "attendance_days": attendance_days,
+        "assigned_clinician_dni": assigned_clinician_dni,
+        "assigned_clinician_name": assigned_clinician_name,
+        "assigned_clinician_profession": assigned_clinician_profession,
+        "wait_days": int(wait_days),
+        "rule_applied": "orden_por_fecha",
     }
 
 

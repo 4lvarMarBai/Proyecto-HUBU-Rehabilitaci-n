@@ -144,3 +144,15 @@ def validar_hora_sesion(selected_patient: dict, session_time_value):
             return f"Este paciente en ambulancia tiene como hora asignada {preferred_hour}."
 
     return None
+
+def validar_dias_asistencia(attendance_days: list[str]):
+    opciones_validas = [
+        ["Lunes", "Miércoles", "Viernes"],
+        ["Martes", "Jueves"],
+        ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes"],
+    ]
+
+    if attendance_days not in opciones_validas:
+        return "Los tratamientos solo pueden programarse como Lunes-Miércoles-Viernes, Martes-Jueves o todos los días laborables."
+
+    return None

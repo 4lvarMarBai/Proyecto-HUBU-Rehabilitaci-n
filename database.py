@@ -132,6 +132,9 @@ def init_db(conn):
             source_waitlist_id BIGINT NOT NULL,
             assigned_by TEXT NOT NULL,
             assigned_at TIMESTAMPTZ NOT NULL,
+            assigned_clinician_dni TEXT,
+            assigned_clinician_name TEXT,
+            assigned_clinician_profession TEXT,
             status TEXT NOT NULL DEFAULT 'ACTIVO',
             discharge_reason TEXT,
             discharge_comment TEXT,
@@ -195,3 +198,6 @@ def init_db(conn):
         cur.execute("ALTER TABLE rehab_active ADD COLUMN IF NOT EXISTS transport_mode TEXT;")
         cur.execute("ALTER TABLE rehab_active ADD COLUMN IF NOT EXISTS preferred_hour TEXT;")
         cur.execute("ALTER TABLE rehab_active ADD COLUMN IF NOT EXISTS coordination_rule TEXT;")
+        cur.execute("ALTER TABLE rehab_active ADD COLUMN IF NOT EXISTS assigned_clinician_dni TEXT;")
+        cur.execute("ALTER TABLE rehab_active ADD COLUMN IF NOT EXISTS assigned_clinician_name TEXT;")
+        cur.execute("ALTER TABLE rehab_active ADD COLUMN IF NOT EXISTS assigned_clinician_profession TEXT;")

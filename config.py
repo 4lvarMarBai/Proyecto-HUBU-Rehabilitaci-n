@@ -6,15 +6,11 @@ DIAS_6_MESES = 183
 
 CLAVE_CONFIGURACION = "admin123"
 
-DIAS_SEMANA = [
-    "Lunes",
-    "Martes",
-    "Miércoles",
-    "Jueves",
-    "Viernes",
-    "Sábado",
-    "Domingo",
-]
+OPCIONES_ASISTENCIA = {
+    "LXV": ["Lunes", "Miércoles", "Viernes"],
+    "MJ": ["Martes", "Jueves"],
+    "LABORABLES": ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes"],
+}
 
 TIPOS_HUECO = ["SIMPLE", "DOBLE"]
 TURNOS = ["MAÑANA", "TARDE"]
