@@ -3,15 +3,24 @@ import re
 # -------------------- Validaciones básicas --------------------
 
 def is_valid_dni(dni: str) -> bool:
-    dni = dni.strip().upper()
-    if not re.fullmatch(r"\d{8}[A-Z]", dni):
+
+
+    if not dni or len(dni) != 9:
+        return False
+
+    dni = dni.upper()
+
+    numero = dni[:8]
+    letra = dni[8]
+
+    if not numero.isdigit() or not letra.isalpha():
         return False
 
     letras = "TRWAGMYFPDXBNJZSQVHLCKE"
-    numero = int(dni[:8])
-    letra_correcta = letras[numero % 23]
-    return dni[-1] == letra_correcta
 
+    letra_correcta = letras[int(numero) % 23]
+
+    return letra == letra_correcta
 
 def is_valid_nhc(nhc: str) -> bool:
     nhc = nhc.strip()

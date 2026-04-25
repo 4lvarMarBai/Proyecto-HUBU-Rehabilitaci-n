@@ -187,6 +187,12 @@ def init_db(conn):
         cur.execute("ALTER TABLE rehab_active ADD COLUMN IF NOT EXISTS attendance_days TEXT;")
         cur.execute("ALTER TABLE treatment_sessions ADD COLUMN IF NOT EXISTS out_of_schedule_reason TEXT;")
 
+        cur.execute("ALTER TABLE treatment_sessions ADD COLUMN IF NOT EXISTS clinical_note TEXT;")
+        cur.execute("ALTER TABLE treatment_sessions ADD COLUMN IF NOT EXISTS pain_eva INTEGER;")
+        cur.execute("ALTER TABLE treatment_sessions ADD COLUMN IF NOT EXISTS functional_status TEXT;")
+        cur.execute("ALTER TABLE treatment_sessions ADD COLUMN IF NOT EXISTS goal_status TEXT;")
+        cur.execute("ALTER TABLE treatment_sessions ADD COLUMN IF NOT EXISTS incidents TEXT;")
+
         cur.execute("ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS slot_type TEXT;")
         cur.execute("ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS time_preference TEXT;")
         cur.execute("ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS transport_mode TEXT;")

@@ -4,6 +4,9 @@
 import calendar
 from datetime import date, time
 
+import pandas as pd
+import matplotlib.pyplot as plt
+
 import streamlit as st
 
 from config import (
@@ -45,6 +48,13 @@ from services import (
     get_stats,
     delete_waitlist_entry,
     delete_active_treatment,
+    get_clinical_followup_summary,
+    generate_clinical_followup_report,
+    get_patient_pain_series,
+    get_patient_status_distribution,
+    get_dashboard_specialty_summary,
+    get_dashboard_session_summary,
+    get_dashboard_adherence_by_specialty,
 )
 from ui_helpers import (
     priority_badge,
@@ -170,6 +180,8 @@ paginas = [
     "📊 Panel de control",
     "📝 Nueva solicitud",
     "⚕️ Tratamientos activos",
+    "📈 Seguimiento clínico",
+    "📉 Dashboard clínico",
     "🧾 Auditoría clínica",
 ]
 
@@ -706,6 +718,45 @@ elif page == "⚕️ Tratamientos activos":
         if session_status in ["REALIZADA", "REVISION"]:
             error_hora = validar_hora_sesion(selected_patient, session_time_value)
 
+        st.markdown("### Registro clínico de la sesión")
+
+        clinical_note = st.text_area(
+            "Nota clínica",
+            placeholder="Describe evolución, hallazgos, respuesta al tratamiento, tolerancia, etc.",
+            key="session_clinical_note"
+        )
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            pain_eva = st.number_input(
+                "Dolor EVA (0-10)",
+                min_value=0,
+                max_value=10,
+                value=0,
+                step=1,
+                key="session_pain_eva"
+            )
+
+        with col_b:
+            goal_status = st.selectbox(
+                "Estado del objetivo terapéutico",
+                ["", "NO_INICIADO", "PARCIAL", "CUMPLIDO", "EMPEORA"],
+                key="session_goal_status"
+            )
+
+        functional_status = st.text_input(
+            "Valoración funcional breve",
+            placeholder="Ej: mejora de la marcha, mayor rango articular, sin cambios en equilibrio...",
+            key="session_functional_status"
+        )
+
+        incidents = st.text_area(
+            "Incidencias",
+            placeholder="Ej: mala tolerancia, reagudización, fatiga, mareo, sin incidencias...",
+            key="session_incidents"
+        )
+
         if st.button("Guardar sesión o falta", width="stretch", key="btn_save_session"):
             if session_status in ["FALTA_JUSTIFICADA", "FALTA_NO_JUSTIFICADA"] and not absence_reason.strip():
                 st.error("Debes indicar el motivo de la falta.")
@@ -725,10 +776,13 @@ elif page == "⚕️ Tratamientos activos":
                     status=session_status,
                     absence_reason=absence_reason.strip(),
                     out_of_schedule_reason=out_of_schedule_reason.strip(),
-                    recorded_by=actor_sidebar
+                    recorded_by=actor_sidebar,
+                    clinical_note=clinical_note,
+                    pain_eva=pain_eva if session_status in ["REALIZADA", "REVISION"] else None,
+                    functional_status=functional_status,
+                    goal_status=goal_status,
+                    incidents=incidents,
                 )
-                st.success("Registro guardado correctamente.")
-                st.rerun()
 
         st.markdown("### Calendario mensual")
         hoy = date.today()
@@ -778,6 +832,271 @@ elif page == "⚕️ Tratamientos activos":
     """)
     data = [{"NHC": r[1]} for r in rows]
     st.dataframe(data, width="stretch", hide_index=True)
+
+elif page == "📈 Seguimiento clínico":
+    st.subheader("Seguimiento clínico del paciente")
+
+    _, rowsA = fetch_all(conn, """
+        SELECT id, patient_id, specialty, subspecialty, start_date
+        FROM rehab_active
+        WHERE status='ACTIVO'
+        ORDER BY id DESC
+    """)
+
+    if not rowsA:
+        st.info("No hay tratamientos activos para seguimiento.")
+    else:
+        options = {
+            f"{r[0]} · {r[1]} · {specialty_label(r[2], r[3])} · inicio {str(r[4])[:10]}": {
+                "rehab_active_id": r[0],
+                "patient_id": r[1],
+                "specialty": r[2],
+                "subspecialty": r[3],
+                "start_date": r[4],
+            }
+            for r in rowsA
+        }
+
+        selected_label = st.selectbox(
+            "Selecciona tratamiento",
+            list(options.keys()),
+            key="followup_patient_pick"
+        )
+
+        selected_patient = options[selected_label]
+
+        summary = get_clinical_followup_summary(conn, selected_patient["rehab_active_id"])
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Adherencia", f"{summary['adherence_percent']}%")
+        c2.metric("Dolor inicial", summary["first_pain"] if summary["first_pain"] is not None else "Sin datos")
+        c3.metric("Dolor actual", summary["last_pain"] if summary["last_pain"] is not None else "Sin datos")
+        c4.metric("Tendencia EVA", summary["pain_trend"])
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Sesiones realizadas", summary["realizadas"])
+        c6.metric("Revisiones", summary["revisiones"])
+        c7.metric("Faltas justificadas", summary["faltas_justificadas"])
+        c8.metric("Faltas no justificadas", summary["faltas_no_justificadas"])
+
+        st.markdown("### Alertas clínicas")
+
+        if summary["abandonment_risk"]:
+            st.warning("Posible riesgo de abandono terapéutico.")
+        else:
+            st.success("Sin indicios claros de abandono terapéutico.")
+
+        if summary["stagnation_risk"]:
+            st.warning("Posible estancamiento funcional. Revisar plan terapéutico.")
+        else:
+            st.success("Sin indicios claros de estancamiento funcional.")
+
+        st.markdown("### Última situación clínica")
+
+        st.write(f"**Valoración funcional:** {summary['last_functional_status'] or 'Sin registro'}")
+        st.write(f"**Estado del objetivo:** {summary['last_goal_status'] or 'Sin registro'}")
+
+        st.markdown("### Informe automático")
+
+        report = generate_clinical_followup_report(conn, selected_patient["rehab_active_id"])
+        st.text_area(
+            "Informe generado",
+            value=report,
+            height=320,
+            key="clinical_followup_report"
+        )
+
+        st.markdown("### Historial clínico de sesiones")
+
+        sess_cols, sess_rows = get_treatment_sessions(conn, selected_patient["rehab_active_id"])
+
+        sess_data = []
+        for r in sess_rows:
+            d = dict(zip(sess_cols, r))
+            d["NHC"] = d.pop("patient_id")
+            d["specialty"] = specialty_label(d["specialty"], d.get("subspecialty"))
+            if hasattr(d["session_date"], "isoformat"):
+                d["session_date"] = d["session_date"].isoformat()
+            d["session_time"] = str(d["session_time"])[:5] if d.get("session_time") is not None else ""
+            d["status"] = estado_sesion_label(d["status"])
+            if hasattr(d["created_at"], "isoformat"):
+                d["created_at"] = d["created_at"].isoformat()
+            d["motivo_falta"] = d.pop("absence_reason")
+            d["motivo_fuera_dias"] = d.pop("out_of_schedule_reason")
+            d["registrado_por"] = d.pop("recorded_by")
+            d["nota_clinica"] = d.pop("clinical_note")
+            d["eva"] = d.pop("pain_eva")
+            d["funcional"] = d.pop("functional_status")
+            d["objetivo"] = d.pop("goal_status")
+            d["incidencias"] = d.pop("incidents")
+            d.pop("subspecialty", None)
+            sess_data.append(d)
+
+        if sess_data:
+            st.dataframe(sess_data, width="stretch", hide_index=True)
+        else:
+            st.info("No hay sesiones registradas para este tratamiento.")
+
+elif page == "📉 Dashboard clínico":
+    st.subheader("Dashboard clínico")
+
+    tab1, tab2 = st.tabs(["Paciente individual", "Resumen global"])
+
+    with tab1:
+        st.markdown("### Evolución del paciente")
+
+        _, rowsA = fetch_all(conn, """
+            SELECT id, patient_id, specialty, subspecialty, start_date
+            FROM rehab_active
+            WHERE status = 'ACTIVO'
+            ORDER BY id DESC
+        """)
+
+        if not rowsA:
+            st.info("No hay tratamientos activos para visualizar.")
+        else:
+            options = {
+                f"{r[0]} · {r[1]} · {specialty_label(r[2], r[3])} · inicio {str(r[4])[:10]}": {
+                    "rehab_active_id": r[0],
+                    "patient_id": r[1],
+                    "specialty": r[2],
+                    "subspecialty": r[3],
+                    "start_date": r[4],
+                }
+                for r in rowsA
+            }
+
+            selected_label = st.selectbox(
+                "Selecciona tratamiento",
+                list(options.keys()),
+                key="dashboard_patient_pick"
+            )
+            selected_patient = options[selected_label]
+
+            resumen = get_clinical_followup_summary(conn, selected_patient["rehab_active_id"])
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Adherencia", f"{resumen['adherence_percent']}%")
+            m2.metric("Realizadas", resumen["realizadas"])
+            m3.metric("Revisiones", resumen["revisiones"])
+            m4.metric("Faltas no justificadas", resumen["faltas_no_justificadas"])
+
+            # -------- Evolución EVA --------
+            st.markdown("#### Evolución del dolor (EVA)")
+            pain_cols, pain_rows = get_patient_pain_series(conn, selected_patient["rehab_active_id"])
+
+            if pain_rows:
+                pain_df = pd.DataFrame(pain_rows, columns=pain_cols)
+                pain_df["session_date"] = pd.to_datetime(pain_df["session_date"])
+
+                fig, ax = plt.subplots(figsize=(8, 4))
+                ax.plot(pain_df["session_date"], pain_df["pain_eva"], marker="o")
+                ax.set_xlabel("Fecha")
+                ax.set_ylabel("EVA")
+                ax.set_title("Evolución EVA")
+                ax.grid(True, alpha=0.3)
+                st.pyplot(fig)
+            else:
+                st.info("No hay datos EVA suficientes para este tratamiento.")
+
+            # -------- Distribución de estados --------
+            st.markdown("#### Distribución de sesiones")
+            dist_cols, dist_rows = get_patient_status_distribution(conn, selected_patient["rehab_active_id"])
+
+            if dist_rows:
+                dist_df = pd.DataFrame(dist_rows, columns=dist_cols)
+                dist_df["status"] = dist_df["status"].map({
+                    "REALIZADA": "Realizada",
+                    "REVISION": "Revisión",
+                    "FALTA_JUSTIFICADA": "Falta justificada",
+                    "FALTA_NO_JUSTIFICADA": "Falta no justificada",
+                })
+
+                fig2, ax2 = plt.subplots(figsize=(7, 4))
+                ax2.bar(dist_df["status"], dist_df["total"])
+                ax2.set_xlabel("Estado")
+                ax2.set_ylabel("Número de sesiones")
+                ax2.set_title("Distribución de estados de sesión")
+                plt.xticks(rotation=20)
+                st.pyplot(fig2)
+            else:
+                st.info("No hay sesiones registradas para mostrar la distribución.")
+
+            # -------- Resumen clínico --------
+            st.markdown("#### Resumen clínico automático")
+            report = generate_clinical_followup_report(conn, selected_patient["rehab_active_id"])
+            st.text_area(
+                "Informe de seguimiento",
+                value=report,
+                height=260,
+                key="dashboard_followup_report"
+            )
+
+    with tab2:
+        st.markdown("### Resumen global del servicio")
+
+        # -------- Especialidades --------
+        sp_cols, sp_rows = get_dashboard_specialty_summary(conn)
+        if sp_rows:
+            sp_df = pd.DataFrame(sp_rows, columns=sp_cols)
+
+            st.markdown("#### Pacientes por especialidad")
+            fig3, ax3 = plt.subplots(figsize=(8, 4))
+            ax3.bar(sp_df["specialty"], sp_df["activos"])
+            ax3.set_xlabel("Especialidad")
+            ax3.set_ylabel("Pacientes activos")
+            ax3.set_title("Pacientes activos por especialidad")
+            plt.xticks(rotation=20)
+            st.pyplot(fig3)
+
+            st.dataframe(sp_df, width="stretch", hide_index=True)
+        else:
+            st.info("No hay datos de especialidades para mostrar.")
+
+        # -------- Estados de sesión globales --------
+        ss_cols, ss_rows = get_dashboard_session_summary(conn)
+        if ss_rows:
+            ss_df = pd.DataFrame(ss_rows, columns=ss_cols)
+            ss_df["status"] = ss_df["status"].map({
+                "REALIZADA": "Realizada",
+                "REVISION": "Revisión",
+                "FALTA_JUSTIFICADA": "Falta justificada",
+                "FALTA_NO_JUSTIFICADA": "Falta no justificada",
+            })
+
+            st.markdown("#### Estados globales de las sesiones")
+            fig4, ax4 = plt.subplots(figsize=(8, 4))
+            ax4.bar(ss_df["status"], ss_df["total"])
+            ax4.set_xlabel("Estado")
+            ax4.set_ylabel("Total")
+            ax4.set_title("Distribución global de estados de sesión")
+            plt.xticks(rotation=20)
+            st.pyplot(fig4)
+        else:
+            st.info("No hay sesiones registradas globalmente.")
+
+        # -------- Adherencia por especialidad --------
+        ad_cols, ad_rows = get_dashboard_adherence_by_specialty(conn)
+        if ad_rows:
+            ad_df = pd.DataFrame(ad_rows, columns=ad_cols)
+
+            ad_df["adherencia_pct"] = ad_df.apply(
+                lambda row: round((row["asistidas"] / row["total"]) * 100, 1) if row["total"] > 0 else 0,
+                axis=1
+            )
+
+            st.markdown("#### Adherencia por especialidad")
+            fig5, ax5 = plt.subplots(figsize=(8, 4))
+            ax5.bar(ad_df["specialty"], ad_df["adherencia_pct"])
+            ax5.set_xlabel("Especialidad")
+            ax5.set_ylabel("Adherencia (%)")
+            ax5.set_title("Adherencia por especialidad")
+            plt.xticks(rotation=20)
+            st.pyplot(fig5)
+
+            st.dataframe(ad_df, width="stretch", hide_index=True)
+        else:
+            st.info("No hay datos de adherencia por especialidad.")
 
 elif page == "🧾 Auditoría clínica":
     st.subheader("Registro de auditoría clínica")
@@ -1009,25 +1328,40 @@ elif page == "⚙️ Ajustes":
             st.info(f"La contraseña inicial del usuario será: {PASSWORD_TEMPORAL_POR_DEFECTO}")
 
         if st.button("Registrar usuario", key="create_user_button"):
+
             if rol_usuario != "ADMIN":
                 st.error("Solo el administrador puede registrar usuarios.")
+
             elif not new_username.strip():
                 st.error("Introduce un nombre de usuario.")
+
             elif not new_full_name.strip():
                 st.error("Introduce el nombre completo.")
+
             elif not is_valid_dni(new_dni):
                 st.error("El DNI no es válido.")
+
             else:
-                create_user(
-                    conn=conn,
-                    username=new_username.strip(),
-                    full_name=new_full_name.strip(),
-                    dni=new_dni,
-                    profession=new_profession,
-                    role=new_role
+                _, dni_existente = fetch_all(
+                    conn,
+                    "SELECT id FROM users WHERE dni = %s LIMIT 1",
+                    (new_dni,)
                 )
-                st.success("Usuario registrado correctamente.")
-                st.rerun()
+
+                if dni_existente:
+                    st.error("Ya existe un usuario registrado con ese DNI.")
+
+                else:
+                    create_user(
+                        conn=conn,
+                        username=new_username.strip(),
+                        full_name=new_full_name.strip(),
+                        dni=new_dni,
+                        profession=new_profession,
+                        role=new_role
+                    )
+                    st.success("Usuario registrado correctamente.")
+                    st.rerun()
 
     st.markdown("### Listado de usuarios")
     usuarios = get_all_users(conn)

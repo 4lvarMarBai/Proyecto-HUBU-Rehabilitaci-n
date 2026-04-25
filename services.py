@@ -211,50 +211,240 @@ def discharge_patient(conn, rehab_active_id, reason, comment, actor):
 # -------------------- SESSIONS --------------------
 def add_treatment_session(
     conn,
-    rehab_active_id,
-    patient_id,
-    specialty,
-    subspecialty,
+    rehab_active_id: int,
+    patient_id: str,
+    specialty: str,
+    subspecialty: str | None,
     session_date_value,
     session_time_value,
-    status,
-    absence_reason,
-    out_of_schedule_reason,
-    recorded_by
+    status: str,
+    absence_reason: str,
+    out_of_schedule_reason: str,
+    recorded_by: str,
+    clinical_note: str = "",
+    pain_eva: int | None = None,
+    functional_status: str = "",
+    goal_status: str = "",
+    incidents: str = "",
 ):
-    now = now_iso()
+    created_at = now_iso()
 
-    execute_sql(conn, """
-        INSERT INTO treatment_sessions (
-            rehab_active_id, patient_id, specialty, subspecialty,
-            session_date, session_time, status,
-            absence_reason, out_of_schedule_reason,
-            recorded_by, created_at
-        )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (
-        rehab_active_id,
-        patient_id,
-        specialty,
-        subspecialty,
-        session_date_value,
-        session_time_value,
-        status,
-        absence_reason,
-        out_of_schedule_reason,
-        recorded_by,
-        now
-    ))
+    if status in ["REALIZADA", "REVISION"]:
+        absence_reason = None
+    elif not absence_reason.strip():
+        absence_reason = "Sin especificar"
+
+    if not out_of_schedule_reason.strip():
+        out_of_schedule_reason = None
+
+    if clinical_note is not None:
+        clinical_note = clinical_note.strip()
+
+    if functional_status is not None:
+        functional_status = functional_status.strip()
+
+    if goal_status is not None:
+        goal_status = goal_status.strip()
+
+    if incidents is not None:
+        incidents = incidents.strip()
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO treatment_sessions
+                (
+                    rehab_active_id,
+                    patient_id,
+                    specialty,
+                    subspecialty,
+                    session_date,
+                    session_time,
+                    status,
+                    absence_reason,
+                    out_of_schedule_reason,
+                    recorded_by,
+                    created_at,
+                    clinical_note,
+                    pain_eva,
+                    functional_status,
+                    goal_status,
+                    incidents
+                )
+            VALUES
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            rehab_active_id,
+            patient_id,
+            specialty,
+            subspecialty,
+            session_date_value,
+            session_time_value,
+            status,
+            absence_reason,
+            out_of_schedule_reason,
+            recorded_by,
+            created_at,
+            clinical_note if clinical_note else None,
+            pain_eva,
+            functional_status if functional_status else None,
+            goal_status if goal_status else None,
+            incidents if incidents else None,
+        ))
 
 
-def get_treatment_sessions(conn, rehab_active_id):
-    return fetch_all(conn, """
-        SELECT *
+def get_treatment_sessions(conn, rehab_active_id: int):
+    cols, rows = fetch_all(conn, """
+        SELECT
+            id,
+            rehab_active_id,
+            patient_id,
+            specialty,
+            subspecialty,
+            session_date,
+            session_time,
+            status,
+            absence_reason,
+            out_of_schedule_reason,
+            recorded_by,
+            created_at,
+            clinical_note,
+            pain_eva,
+            functional_status,
+            goal_status,
+            incidents
         FROM treatment_sessions
-        WHERE rehab_active_id=%s
-        ORDER BY session_date DESC
+        WHERE rehab_active_id = %s
+        ORDER BY session_date DESC, session_time DESC NULLS LAST, id DESC
+    """, (rehab_active_id,))
+    return cols, rows
+
+def get_clinical_followup_summary(conn, rehab_active_id: int):
+    _, rows = fetch_all(conn, """
+        SELECT
+            session_date,
+            status,
+            pain_eva,
+            functional_status,
+            goal_status,
+            clinical_note
+        FROM treatment_sessions
+        WHERE rehab_active_id = %s
+        ORDER BY session_date ASC, id ASC
     """, (rehab_active_id,))
 
+    total_sessions = 0
+    realizadas = 0
+    revisiones = 0
+    faltas_justificadas = 0
+    faltas_no_justificadas = 0
+
+    pain_values = []
+    last_functional_status = None
+    last_goal_status = None
+
+    for row in rows:
+        _, status, pain_eva, functional_status, goal_status, _ = row
+        total_sessions += 1
+
+        if status == "REALIZADA":
+            realizadas += 1
+        elif status == "REVISION":
+            revisiones += 1
+        elif status == "FALTA_JUSTIFICADA":
+            faltas_justificadas += 1
+        elif status == "FALTA_NO_JUSTIFICADA":
+            faltas_no_justificadas += 1
+
+        if pain_eva is not None:
+            pain_values.append(int(pain_eva))
+
+        if functional_status:
+            last_functional_status = functional_status
+
+        if goal_status:
+            last_goal_status = goal_status
+
+    adherence_denominator = realizadas + revisiones + faltas_justificadas + faltas_no_justificadas
+    adherence_percent = 0
+    if adherence_denominator > 0:
+        adherence_percent = round(((realizadas + revisiones) / adherence_denominator) * 100, 1)
+
+    first_pain = pain_values[0] if pain_values else None
+    last_pain = pain_values[-1] if pain_values else None
+
+    pain_trend = "Sin datos"
+    if first_pain is not None and last_pain is not None:
+        if last_pain < first_pain:
+            pain_trend = "Mejora"
+        elif last_pain > first_pain:
+            pain_trend = "Empeora"
+        else:
+            pain_trend = "Sin cambios"
+
+    abandonment_risk = faltas_no_justificadas >= 2
+    stagnation_risk = last_goal_status in ["NO_INICIADO", "PARCIAL"] and pain_trend == "Sin cambios"
+
+    return {
+        "total_sessions": total_sessions,
+        "realizadas": realizadas,
+        "revisiones": revisiones,
+        "faltas_justificadas": faltas_justificadas,
+        "faltas_no_justificadas": faltas_no_justificadas,
+        "adherence_percent": adherence_percent,
+        "first_pain": first_pain,
+        "last_pain": last_pain,
+        "pain_trend": pain_trend,
+        "last_functional_status": last_functional_status,
+        "last_goal_status": last_goal_status,
+        "abandonment_risk": abandonment_risk,
+        "stagnation_risk": stagnation_risk,
+    }
+
+def generate_clinical_followup_report(conn, rehab_active_id: int):
+    summary = get_clinical_followup_summary(conn, rehab_active_id)
+
+    texto = []
+    texto.append("INFORME AUTOMÁTICO DE SEGUIMIENTO CLÍNICO")
+    texto.append("")
+    texto.append(f"Sesiones registradas: {summary['total_sessions']}")
+    texto.append(f"Sesiones realizadas: {summary['realizadas']}")
+    texto.append(f"Revisiones: {summary['revisiones']}")
+    texto.append(f"Faltas justificadas: {summary['faltas_justificadas']}")
+    texto.append(f"Faltas no justificadas: {summary['faltas_no_justificadas']}")
+    texto.append(f"Adherencia estimada: {summary['adherence_percent']}%")
+    texto.append("")
+
+    if summary["first_pain"] is not None and summary["last_pain"] is not None:
+        texto.append(
+            f"Evolución del dolor (EVA): inicial {summary['first_pain']} / actual {summary['last_pain']} "
+            f"→ tendencia: {summary['pain_trend']}."
+        )
+    else:
+        texto.append("Evolución del dolor (EVA): sin datos suficientes.")
+
+    if summary["last_functional_status"]:
+        texto.append(f"Última valoración funcional: {summary['last_functional_status']}.")
+    else:
+        texto.append("Última valoración funcional: sin registro.")
+
+    if summary["last_goal_status"]:
+        texto.append(f"Estado del objetivo terapéutico: {summary['last_goal_status']}.")
+    else:
+        texto.append("Estado del objetivo terapéutico: sin registro.")
+
+    texto.append("")
+
+    if summary["abandonment_risk"]:
+        texto.append("Alerta: posible riesgo de abandono terapéutico por faltas no justificadas.")
+    else:
+        texto.append("No se detectan signos claros de abandono terapéutico.")
+
+    if summary["stagnation_risk"]:
+        texto.append("Alerta: posible estancamiento funcional. Se recomienda revisar el plan terapéutico.")
+    else:
+        texto.append("No se detectan signos claros de estancamiento funcional.")
+
+    return "\n".join(texto)
 
 def get_session_summary(conn, rehab_active_id):
     _, rows = fetch_all(conn, """
@@ -370,3 +560,64 @@ def delete_active_treatment(conn, rehab_active_id: int, actor: str):
             """, (rehab_active_id,))
 
     return True, "Tratamiento eliminado correctamente."
+
+def get_patient_pain_series(conn, rehab_active_id: int):
+    cols, rows = fetch_all(conn, """
+        SELECT session_date, pain_eva
+        FROM treatment_sessions
+        WHERE rehab_active_id = %s
+          AND pain_eva IS NOT NULL
+          AND status IN ('REALIZADA', 'REVISION')
+        ORDER BY session_date ASC, id ASC
+    """, (rehab_active_id,))
+    return cols, rows
+
+
+def get_patient_status_distribution(conn, rehab_active_id: int):
+    cols, rows = fetch_all(conn, """
+        SELECT status, COUNT(*) AS total
+        FROM treatment_sessions
+        WHERE rehab_active_id = %s
+        GROUP BY status
+        ORDER BY status ASC
+    """, (rehab_active_id,))
+    return cols, rows
+
+
+def get_dashboard_specialty_summary(conn):
+    cols, rows = fetch_all(conn, """
+        SELECT
+            specialty,
+            COUNT(*) FILTER (WHERE status = 'ACTIVO') AS activos,
+            COUNT(*) FILTER (WHERE status = 'ALTA') AS altas
+        FROM rehab_active
+        GROUP BY specialty
+        ORDER BY specialty ASC
+    """)
+    return cols, rows
+
+
+def get_dashboard_session_summary(conn):
+    cols, rows = fetch_all(conn, """
+        SELECT
+            status,
+            COUNT(*) AS total
+        FROM treatment_sessions
+        GROUP BY status
+        ORDER BY status ASC
+    """)
+    return cols, rows
+
+
+def get_dashboard_adherence_by_specialty(conn):
+    cols, rows = fetch_all(conn, """
+        SELECT
+            specialty,
+            COUNT(*) FILTER (WHERE status IN ('REALIZADA', 'REVISION')) AS asistidas,
+            COUNT(*) FILTER (WHERE status IN ('FALTA_JUSTIFICADA', 'FALTA_NO_JUSTIFICADA')) AS faltas,
+            COUNT(*) AS total
+        FROM treatment_sessions
+        GROUP BY specialty
+        ORDER BY specialty ASC
+    """)
+    return cols, rows
